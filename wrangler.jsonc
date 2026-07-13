@@ -2,5 +2,5 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "overpanel",
   "main": "src/index.js",
-  "compatibility_date": "2026-07-14"
+  "compatibility_date": "2026-07-01"
 }
