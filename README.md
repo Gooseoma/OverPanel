@@ -8,7 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Carbon](https://img.shields.io/badge/Carbon-поддерживается-orange)](https://carbonmod.gg)
-[![Oxide](https://img.shields.io/badge/Oxide-поддерживается-blue)](https://umod.org)
+[![Oxide/uMod](https://img.shields.io/badge/Oxide%2FuMod-поддерживается-blue)](https://umod.org)
 [![Status](https://img.shields.io/badge/статус-в%20разработке-yellow)](#статус-проекта)
 
 </div>
@@ -19,7 +19,7 @@
 
 OverPanel — это панель, через которую владелец Rust-серверов управляет своими проектами: выдаёт права администрации, банит читеров, следит за консолью сервера и смотрит статистику. Подходит и для одного маленького сервера, и для сети из десятков серверов сразу.
 
-Мы старались не захламлять интерфейс — только то, что реально нужно для управления сервером и командой.
+Мы старались не захламлять интерфейс — только то, что реально нужно для управления сервером.
 
 ---
 
