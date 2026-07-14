@@ -8,7 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Carbon](https://img.shields.io/badge/Carbon-поддерживается-orange)](https://carbonmod.gg)
-[![Oxide/umod](https://img.shields.io/badge/Oxide-поддерживается-blue)](https://umod.org)
+[![Oxide/uMod](https://img.shields.io/badge/Oxide%2FuMod-поддерживается-blue)](https://umod.org)
 [![Status](https://img.shields.io/badge/статус-в%20разработке-yellow)](#статус-проекта)
 
 </div>
