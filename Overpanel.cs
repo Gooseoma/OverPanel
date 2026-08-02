@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -52,6 +53,7 @@ namespace Oxide.Plugins
             if (!ValidateAudioFiles()) return;
 
             CreateDirectoryStructure();
+            LoadLocalReportBackground();
             LoadConfig();
             InitPermissionsCache();
             InitWebSocket();
@@ -868,9 +870,10 @@ namespace Oxide.Plugins
                 case "config.update":     HandleActionConfigUpdate(msg);     break;
                 case "roles.update":      HandleActionRolesUpdate(msg);      break;
 
-                case "report.message":    HandleActionReportMessage(msg); break;
-                case "report.close":      HandleActionReportClose(msg);   break;
-                case "report.registered": HandleActionReportRegistered(msg); break;
+                case "report.message":       HandleActionReportMessage(msg); break;
+                case "report.close":         HandleActionReportClose(msg);   break;
+                case "report.registered":    HandleActionReportRegistered(msg); break;
+                case "report.list_response": HandleActionReportListResponse(msg); break;
 
                 case "player.teleport":   HandleActionTeleport(msg); break;
 
@@ -2031,8 +2034,9 @@ namespace Oxide.Plugins
 
         private const string CHECK_PANEL_UI  = "overpanel.check";
         private const string RESTART_PANEL_UI = "overpanel.restart";
-        private const string REPORT_PANEL_UI  = "overpanel.report";
         private const string RULES_PANEL_UI   = "overpanel.rules";
+        private const string REPORT_LIST_PANEL_UI   = "overpanel.report.list";
+        private const string REPORT_DETAIL_PANEL_UI = "overpanel.report.detail";
 
         private Dictionary<ulong, bool> _activeChecks = new Dictionary<ulong, bool>();
 
@@ -2205,6 +2209,324 @@ namespace Oxide.Plugins
                 CuiHelper.DestroyUi(player, RULES_PANEL_UI);
         }
 
+        // ======= REPORT CUI =======
+        //
+        // Данные (ReportEntryData/кэш/запросы к панели) живут в регионе
+        // "Reports & Player Commands" — здесь только построение экранов.
+
+        private static readonly Dictionary<string, string> ReportStatusLabel = new Dictionary<string, string>
+        {
+            ["new"]         = "Новое",
+            ["in_progress"] = "В работе",
+            ["closed"]      = "Закрыто",
+        };
+
+        private static string Rect(double v) => v.ToString("F3", CultureInfo.InvariantCulture);
+
+        private string GetReportStatusColor(ReportEntryData r)
+        {
+            if (r.Status == "closed") return "0.55 0.55 0.55 1";
+            if (r.NeedsHelp) return "0.4 0.65 1 1";
+            if (r.IsPriority) return "1 0.35 0.35 1";
+            return "0.35 0.85 0.45 1";
+        }
+
+        /// <summary>
+        /// Фон обоих экранов /report. Если в data/Overpanel/images/REPORT_SCREEN.png
+        /// лежит картинка (разрешение 1202×805) — используется она (через FileStorage,
+        /// отдельным CuiRawImageComponent — Png на CuiPanel.Image в этой версии CUI API
+        /// не гарантирован), иначе сплошная заливка. Никакого интерфейса загрузки —
+        /// файл кладётся на сервер напрямую.
+        /// </summary>
+        private string AddReportBackgroundPanel(CuiElementContainer elements, string uiName)
+        {
+            var panel = elements.Add(new CuiPanel
+            {
+                Image = { Color = "0.05 0.05 0.05 0.97" },
+                RectTransform = { AnchorMin = "0.22 0.08", AnchorMax = "0.78 0.92" },
+                CursorEnabled = true
+            }, "Overlay", uiName);
+
+            if (_reportBgCrc.HasValue)
+            {
+                elements.Add(new CuiElement
+                {
+                    Parent = panel,
+                    Components =
+                    {
+                        new CuiRawImageComponent { Png = _reportBgCrc.Value.ToString(), Color = "1 1 1 1" },
+                        new CuiRectTransformComponent { AnchorMin = "0 0", AnchorMax = "1 1" }
+                    }
+                });
+            }
+
+            return panel;
+        }
+
+        internal void ShowReportListScreen(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+            _openReportDetail.Remove(player.userID);
+
+            var reports = _reportListCache.TryGetValue(player.userID, out var list) ? list : new List<ReportEntryData>();
+
+            var elements = new CuiElementContainer();
+            var panel = AddReportBackgroundPanel(elements, REPORT_LIST_PANEL_UI);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "МОИ ОБРАЩЕНИЯ", FontSize = 18, Align = TextAnchor.MiddleCenter, Color = "0.6 1 0.6 1" },
+                RectTransform = { AnchorMin = "0 0.91", AnchorMax = "1 1" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.close", Color = "0.3 0.1 0.1 1" },
+                RectTransform = { AnchorMin = "0.93 0.94", AnchorMax = "0.99 0.99" },
+                Text = { Text = "X", FontSize = 12, Align = TextAnchor.MiddleCenter }
+            }, panel);
+
+            if (reports.Count == 0)
+            {
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = "Обращений пока нет.\n\nЧтобы создать: /report <ник или SteamID> <причина>",
+                             FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1" },
+                    RectTransform = { AnchorMin = "0.05 0.4", AnchorMax = "0.95 0.85" }
+                }, panel);
+            }
+            else
+            {
+                const int maxRows = 8;
+                var shown = reports.Take(maxRows).ToList();
+                var rowHeight = 0.82 / shown.Count;
+
+                for (var i = 0; i < shown.Count; i++)
+                {
+                    var r = shown[i];
+                    var top = 0.87 - i * rowHeight;
+                    var bottom = top - rowHeight + 0.01;
+
+                    var row = elements.Add(new CuiButton
+                    {
+                        Button = { Command = $"overpanel.report.open {r.Id}", Color = "1 1 1 0.06" },
+                        RectTransform = { AnchorMin = $"0.04 {Rect(bottom)}", AnchorMax = $"0.96 {Rect(top)}" },
+                        Text = { Text = "" }
+                    }, panel);
+
+                    elements.Add(new CuiLabel
+                    {
+                        Text = { Text = r.Id, FontSize = 13, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
+                        RectTransform = { AnchorMin = "0.03 0", AnchorMax = "0.4 1" }
+                    }, row);
+
+                    elements.Add(new CuiLabel
+                    {
+                        Text = { Text = ReportStatusLabel.TryGetValue(r.Status, out var label) ? label : r.Status,
+                                 FontSize = 12, Align = TextAnchor.MiddleRight, Color = GetReportStatusColor(r) },
+                        RectTransform = { AnchorMin = "0.4 0", AnchorMax = "0.97 1" }
+                    }, row);
+                }
+            }
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Новое обращение: /report <ник или SteamID> <причина>",
+                         FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "0.6 0.6 0.6 1" },
+                RectTransform = { AnchorMin = "0 0.005", AnchorMax = "1 0.05" }
+            }, panel);
+
+            CuiHelper.AddUi(player, elements);
+        }
+
+        internal void ShowReportDetailScreen(BasePlayer player, string reportId)
+        {
+            if (!_reportListCache.TryGetValue(player.userID, out var reports)) return;
+            var report = reports.FirstOrDefault(r => r.Id == reportId);
+            if (report == null) return;
+
+            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+            _openReportDetail[player.userID] = reportId;
+
+            var elements = new CuiElementContainer();
+            var panel = AddReportBackgroundPanel(elements, REPORT_DETAIL_PANEL_UI);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.back", Color = "0.15 0.15 0.15 1" },
+                RectTransform = { AnchorMin = "0.02 0.94", AnchorMax = "0.16 0.99" },
+                Text = { Text = "< Назад", FontSize = 11, Align = TextAnchor.MiddleCenter }
+            }, panel);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = $"Обращение {report.Id}", FontSize = 16, Align = TextAnchor.MiddleCenter, Color = "0.6 1 0.6 1" },
+                RectTransform = { AnchorMin = "0.16 0.94", AnchorMax = "0.86 0.99" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.close", Color = "0.3 0.1 0.1 1" },
+                RectTransform = { AnchorMin = "0.93 0.94", AnchorMax = "0.99 0.99" },
+                Text = { Text = "X", FontSize = 12, Align = TextAnchor.MiddleCenter }
+            }, panel);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = ReportStatusLabel.TryGetValue(report.Status, out var statusLabel) ? statusLabel : report.Status,
+                         FontSize = 11, Align = TextAnchor.MiddleCenter, Color = GetReportStatusColor(report) },
+                RectTransform = { AnchorMin = "0.35 0.895", AnchorMax = "0.65 0.935" }
+            }, panel);
+
+            // ── переписка: последние сообщения, без прокрутки ──
+            const int maxMessages = 8;
+            var shownMessages = report.Messages.Count > maxMessages
+                ? report.Messages.Skip(report.Messages.Count - maxMessages).ToList()
+                : report.Messages;
+
+            if (shownMessages.Count == 0)
+            {
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = "Сообщений пока нет.", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.6 0.6 0.6 1" },
+                    RectTransform = { AnchorMin = "0.05 0.5", AnchorMax = "0.95 0.6" }
+                }, panel);
+            }
+            else
+            {
+                const double msgAreaTop = 0.885;
+                const double msgAreaBottom = 0.26;
+                var rowHeight = (msgAreaTop - msgAreaBottom) / shownMessages.Count;
+
+                for (var i = 0; i < shownMessages.Count; i++)
+                {
+                    var m = shownMessages[i];
+                    var top = msgAreaTop - i * rowHeight;
+                    var bottom = top - rowHeight;
+                    var isPlayer = m.AuthorType == "player";
+
+                    elements.Add(new CuiLabel
+                    {
+                        Text =
+                        {
+                            Text = (isPlayer ? "Вы: " : "Администратор: ") + m.Text,
+                            FontSize = 12,
+                            Align = isPlayer ? TextAnchor.MiddleRight : TextAnchor.MiddleLeft,
+                            Color = isPlayer ? "0.85 0.85 1 1" : "0.7 1 0.7 1"
+                        },
+                        RectTransform = { AnchorMin = $"0.04 {Rect(bottom)}", AnchorMax = $"0.96 {Rect(top)}" }
+                    }, panel);
+                }
+            }
+
+            // ── поле ввода (Enter отправляет сообщение) ──
+            var inputBg = elements.Add(new CuiPanel
+            {
+                Image = { Color = "0 0 0 0.35" },
+                RectTransform = { AnchorMin = "0.04 0.155", AnchorMax = "0.96 0.235" }
+            }, panel);
+
+            elements.Add(new CuiElement
+            {
+                Parent = inputBg,
+                Components =
+                {
+                    new CuiInputFieldComponent
+                    {
+                        Command = $"overpanel.report.send {report.Id}",
+                        FontSize = 13,
+                        Color = "1 1 1 1",
+                        CharsLimit = 300,
+                        NeedsKeyboard = true,
+                        Align = TextAnchor.MiddleLeft,
+                        Text = "",
+                    },
+                    new CuiRectTransformComponent { AnchorMin = "0.01 0.05", AnchorMax = "0.99 0.95" }
+                }
+            });
+
+            if (report.Status != "closed")
+            {
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"overpanel.report.resolve {report.Id}", Color = "0.15 0.35 0.15 1" },
+                    RectTransform = { AnchorMin = "0.04 0.02", AnchorMax = "0.48 0.09" },
+                    Text = { Text = "Проблема решена", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.8 1 0.8 1" }
+                }, panel);
+
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = $"overpanel.report.urgent {report.Id}", Color = "0.35 0.15 0.15 1" },
+                    RectTransform = { AnchorMin = "0.52 0.02", AnchorMax = "0.96 0.09" },
+                    Text = { Text = "Проблема актуальна", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 0.85 0.85 1" }
+                }, panel);
+            }
+            else
+            {
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = "Обращение закрыто", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.6 0.6 0.6 1" },
+                    RectTransform = { AnchorMin = "0.04 0.02", AnchorMax = "0.96 0.09" }
+                }, panel);
+            }
+
+            CuiHelper.AddUi(player, elements);
+        }
+
+        [ConsoleCommand("overpanel.report.open")]
+        private void CmdReportOpen(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length < 1) return;
+            ShowReportDetailScreen(player, arg.Args[0]);
+        }
+
+        [ConsoleCommand("overpanel.report.back")]
+        private void CmdReportBack(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowReportListScreen(player);
+        }
+
+        [ConsoleCommand("overpanel.report.close")]
+        private void CmdReportCloseScreen(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+            _openReportDetail.Remove(player.userID);
+        }
+
+        [ConsoleCommand("overpanel.report.resolve")]
+        private void CmdReportResolve(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length < 1) return;
+            MarkReportResolved(player, arg.Args[0]);
+        }
+
+        [ConsoleCommand("overpanel.report.urgent")]
+        private void CmdReportUrgent(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length < 1) return;
+            MarkReportUrgent(player, arg.Args[0]);
+        }
+
+        [ConsoleCommand("overpanel.report.send")]
+        private void CmdReportSend(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length < 1) return;
+
+            var reportId = arg.Args[0];
+            var text = arg.Args.Length > 1 ? string.Join(" ", arg.Args, 1, arg.Args.Length - 1) : "";
+            SendReportMessage(player, reportId, text);
+        }
+
         // ======= CLEANUP =======
 
         private void CleanupAll()
@@ -2213,7 +2535,8 @@ namespace Oxide.Plugins
             {
                 CuiHelper.DestroyUi(player, CHECK_PANEL_UI);
                 CuiHelper.DestroyUi(player, RESTART_PANEL_UI);
-                CuiHelper.DestroyUi(player, REPORT_PANEL_UI);
+                CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+                CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
                 CuiHelper.DestroyUi(player, RULES_PANEL_UI);
             }
             _restartCountdownTimer?.Destroy();
@@ -2248,6 +2571,34 @@ namespace Oxide.Plugins
             "disk.yandex.ru", "yadi.sk", "dropbox.com", "drive.google.com",
         };
 
+        // ── Кэш /report CUI ──────────────────────────────────────────
+        //
+        // Плагин не хранит обращения у себя — список запрашивается у панели
+        // (report.list_request → report.list_response, тот же принцип, что и
+        // rcon.exec → rcon.output) и кэшируется на время сессии игрока.
+
+        private class ReportMessageData
+        {
+            [JsonProperty("author_type")] public string AuthorType;
+            [JsonProperty("text")] public string Text;
+            [JsonProperty("created_at")] public string CreatedAt;
+        }
+
+        private class ReportEntryData
+        {
+            [JsonProperty("id")] public string Id;
+            [JsonProperty("status")] public string Status;
+            [JsonProperty("is_priority")] public bool IsPriority;
+            [JsonProperty("needs_help")] public bool NeedsHelp;
+            [JsonProperty("created_at")] public string CreatedAt;
+            [JsonProperty("messages")] public List<ReportMessageData> Messages = new List<ReportMessageData>();
+        }
+
+        private readonly Dictionary<ulong, List<ReportEntryData>> _reportListCache = new Dictionary<ulong, List<ReportEntryData>>();
+        private readonly Dictionary<string, ulong> _reportListRequests = new Dictionary<string, ulong>();
+        private readonly Dictionary<ulong, string> _openReportDetail = new Dictionary<ulong, string>();
+        private readonly Dictionary<ulong, string> _pendingOpenReportId = new Dictionary<ulong, string>();
+
         // ── /report ──────────────────────────────────────────────────
 
         private void CmdReport(IPlayer player, string command, string[] args)
@@ -2261,10 +2612,17 @@ namespace Oxide.Plugins
             var basePlayer = player.Object as BasePlayer;
             if (basePlayer == null) return;
 
+            if (args.Length == 0)
+            {
+                RequestReportList(basePlayer);
+                return;
+            }
+
             if (args.Length < 2)
             {
                 player.Reply("[Overpanel] Использование: /report <SteamID или имя> <причина>");
                 player.Reply("[Overpanel] Ссылку на доказательства можно вставить прямо в текст.");
+                player.Reply("[Overpanel] Или просто /report — список ваших обращений.");
                 return;
             }
 
@@ -2308,6 +2666,109 @@ namespace Oxide.Plugins
 
             NotifyAdminsInGame(
                 $"<color=#5599FF>[ОБРАЩЕНИЕ]</color> от <color=#ffcc00>{GetPlayerName(author)}</color>: {text}");
+        }
+
+        // ── CUI: список и переписка по обращениям ────────────────────
+
+        private void RequestReportList(BasePlayer player)
+        {
+            if (!IsBackendConnected)
+            {
+                SendReply(player, "[Overpanel] Панель недоступна, попробуйте позже.");
+                return;
+            }
+
+            var requestId = Guid.NewGuid().ToString("N");
+            _reportListRequests[requestId] = player.userID;
+
+            SendEvent("report.list_request", new Dictionary<string, object>
+            {
+                ["steamid"] = player.UserIDString,
+            }, requestId);
+        }
+
+        private void HandleActionReportListResponse(JObject msg)
+        {
+            var requestId = msg["request_id"]?.ToString();
+            if (string.IsNullOrEmpty(requestId) || !_reportListRequests.TryGetValue(requestId, out var userId))
+                return;
+            _reportListRequests.Remove(requestId);
+
+            var player = BasePlayer.FindByID(userId);
+            if (player == null || !player.IsConnected) return;
+
+            var reports = msg["reports"]?.ToObject<List<ReportEntryData>>() ?? new List<ReportEntryData>();
+            _reportListCache[userId] = reports;
+
+            if (_pendingOpenReportId.TryGetValue(userId, out var pendingId))
+            {
+                _pendingOpenReportId.Remove(userId);
+                if (reports.Any(r => r.Id == pendingId))
+                {
+                    ShowReportDetailScreen(player, pendingId);
+                    return;
+                }
+            }
+
+            ShowReportListScreen(player);
+        }
+
+        /// <summary>Игрок написал ответ администратору в открытом обращении.</summary>
+        private void SendReportMessage(BasePlayer player, string reportId, string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+
+            SendEvent("report.message", new Dictionary<string, object>
+            {
+                ["report_id"]      = reportId,
+                ["author_steamid"] = player.UserIDString,
+                ["text"]           = text.Trim(),
+            });
+
+            // Оптимистично добавляем своё сообщение в кэш, не дожидаясь round-trip
+            if (_reportListCache.TryGetValue(player.userID, out var reports))
+            {
+                var report = reports.FirstOrDefault(r => r.Id == reportId);
+                report?.Messages.Add(new ReportMessageData
+                {
+                    AuthorType = "player",
+                    Text = text.Trim(),
+                    CreatedAt = DateTime.UtcNow.ToString("o"),
+                });
+            }
+
+            ShowReportDetailScreen(player, reportId);
+        }
+
+        private void MarkReportResolved(BasePlayer player, string reportId)
+        {
+            SendEvent("report.closed", new Dictionary<string, object>
+            {
+                ["report_id"] = reportId,
+                ["closed_by"] = player.UserIDString,
+            });
+
+            SendReply(player, $"[Overpanel] Обращение {reportId} закрыто.");
+            RequestReportList(player);
+        }
+
+        private void MarkReportUrgent(BasePlayer player, string reportId)
+        {
+            SendEvent("report.mark_urgent", new Dictionary<string, object>
+            {
+                ["report_id"] = reportId,
+                ["steamid"]   = player.UserIDString,
+            });
+
+            SendReply(player, $"[Overpanel] Обращение {reportId} помечено как актуальное.");
+
+            if (_reportListCache.TryGetValue(player.userID, out var reports))
+            {
+                var report = reports.FirstOrDefault(r => r.Id == reportId);
+                if (report != null) report.IsPriority = true;
+            }
+
+            ShowReportDetailScreen(player, reportId);
         }
 
         /// <summary>Достаёт ссылки на облачные хранилища из текста обращения.</summary>
@@ -2463,7 +2924,7 @@ namespace Oxide.Plugins
                 SendReply(player, $"<color=#66ff66>[Overpanel]</color> Ваше обращение {reportId} закрыто.");
         }
 
-        /// <summary>Панель вернула ID созданного обращения — показываем его игроку.</summary>
+        /// <summary>Панель вернула ID созданного обращения — показываем его игроку в CUI.</summary>
         private void HandleActionReportRegistered(JObject msg)
         {
             var authorId = msg["author_steamid"]?.ToString();
@@ -2472,8 +2933,13 @@ namespace Oxide.Plugins
             if (string.IsNullOrEmpty(authorId)) return;
 
             var player = BasePlayer.Find(authorId);
-            if (player != null && player.IsConnected)
-                SendReply(player, $"<color=#66ff66>[Overpanel]</color> Обращение принято. Номер: <color=#ffcc00>{reportId}</color>");
+            if (player == null || !player.IsConnected) return;
+
+            SendReply(player, $"<color=#66ff66>[Overpanel]</color> Обращение принято. Номер: <color=#ffcc00>{reportId}</color>");
+
+            // report.list_response ниже подхватит _pendingOpenReportId и откроет CUI обращения
+            _pendingOpenReportId[player.userID] = reportId;
+            RequestReportList(player);
         }
 
         #endregion
@@ -2863,22 +3329,57 @@ namespace Oxide.Plugins
             var targetId = msg["target_steamid"]?.ToString();
             var message  = msg["message"]?.ToString();
             var senderTitle = msg["admin_title"]?.ToString();
+            var notificationType = msg["notification_type"]?.ToString();
+            var reportId = msg["report_id"]?.ToString();
 
             if (string.IsNullOrEmpty(message)) return;
 
-            var text = string.IsNullOrEmpty(senderTitle)
-                ? $"[Overpanel] {message}"
-                : $"<color=#5599FF>[{senderTitle}]</color> {message}";
-
             if (string.IsNullOrEmpty(targetId))
             {
-                Server.Broadcast(text);
+                var broadcastText = string.IsNullOrEmpty(senderTitle)
+                    ? $"[Overpanel] {message}"
+                    : $"<color=#5599FF>[{senderTitle}]</color> {message}";
+                Server.Broadcast(broadcastText);
                 return;
             }
 
             var player = BasePlayer.Find(targetId);
-            if (player != null && player.IsConnected)
-                SendReply(player, text);
+            if (player == null || !player.IsConnected) return;
+
+            if (notificationType == "report.admin_message" && !string.IsNullOrEmpty(reportId))
+            {
+                var adminTitle = string.IsNullOrEmpty(senderTitle) ? "Администратор" : senderTitle;
+                SendReply(player, $"<color=#5599FF>[Обращение {reportId}]</color> <color=#66ff66>{adminTitle}</color>: {message}");
+                HandleIncomingReportReply(player, reportId, message);
+                return;
+            }
+
+            var text = string.IsNullOrEmpty(senderTitle)
+                ? $"[Overpanel] {message}"
+                : $"<color=#5599FF>[{senderTitle}]</color> {message}";
+            SendReply(player, text);
+        }
+
+        /// <summary>Обновляет локальный кэш /report CUI и перерисовывает открытый экран, если он открыт.</summary>
+        private void HandleIncomingReportReply(BasePlayer player, string reportId, string text)
+        {
+            if (_reportListCache.TryGetValue(player.userID, out var reports))
+            {
+                var report = reports.FirstOrDefault(r => r.Id == reportId);
+                if (report != null)
+                {
+                    report.Messages.Add(new ReportMessageData
+                    {
+                        AuthorType = "admin",
+                        Text = text,
+                        CreatedAt = DateTime.UtcNow.ToString("o"),
+                    });
+                    if (report.Status == "new") report.Status = "in_progress";
+                }
+            }
+
+            if (_openReportDetail.TryGetValue(player.userID, out var openId) && openId == reportId)
+                ShowReportDetailScreen(player, reportId);
         }
 
         private void HandleActionTeleport(JObject msg)
@@ -3031,27 +3532,35 @@ namespace Oxide.Plugins
             }
         }
 
-        // ======= ImageLibrary =======
+        // ======= Локальный фон /report =======
 
-        private void LoadCustomImages()
+        private uint? _reportBgCrc;
+
+        /// <summary>
+        /// Грузит data/Overpanel/images/REPORT_SCREEN.png (1202×805) через FileStorage,
+        /// без внешнего хостинга и без ImageLibrary — просто кладёте файл на сервер.
+        /// Если файла нет, экраны /report используют сплошную заливку.
+        /// </summary>
+        private void LoadLocalReportBackground()
         {
-            if (!_imageLibraryLoaded || ImageLibrary == null) return;
+            var path = Path.Combine(Interface.Oxide.DataDirectory, "Overpanel", "images", "REPORT_SCREEN.png");
+            if (!File.Exists(path))
+            {
+                _reportBgCrc = null;
+                return;
+            }
+
             try
             {
-                // Load report screen background
-                ImageLibrary.Call("AddImage", "https://example.com/REPORT_SCREEN.png", "overpanel_report_bg");
-                Puts("[Overpanel] ImageLibrary: custom images queued");
+                var bytes = File.ReadAllBytes(path);
+                _reportBgCrc = FileStorage.server.Store(bytes, FileStorage.Type.png, CommunityEntity.ServerInstance.net.ID);
+                Puts("[Overpanel] Фон /report загружен из data/Overpanel/images/REPORT_SCREEN.png");
             }
             catch (Exception ex)
             {
-                PrintWarning($"[Overpanel] ImageLibrary load failed: {ex.Message}");
+                PrintWarning($"[Overpanel] Не удалось загрузить REPORT_SCREEN.png: {ex.Message}");
+                _reportBgCrc = null;
             }
-        }
-
-        private string GetImageId(string imageName)
-        {
-            if (!_imageLibraryLoaded || ImageLibrary == null) return "";
-            return ImageLibrary.Call<string>("GetImage", imageName) ?? "";
         }
 
         #endregion
