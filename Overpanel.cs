@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Overpanel Team", "1.0.0")]
+    [Info("Overpanel", "Gooseoma", "1.0.3")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -143,7 +143,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.0";
+        internal const string PLUGIN_VERSION = "1.0.3";
 
         internal PluginConfig _config;
 
@@ -2209,39 +2209,77 @@ namespace Oxide.Plugins
 
         // ======= REPORT CUI =======
         //
+        // Двухколоночный интерфейс: слева список обращений, справа переписка.
         // Данные (ReportEntryData/кэш/запросы к панели) живут в регионе
         // "Reports & Player Commands" — здесь только построение экранов.
 
         private static readonly Dictionary<string, string> ReportStatusLabel = new Dictionary<string, string>
         {
-            ["new"]         = "Новое",
+            ["new"]         = "Открыт",
             ["in_progress"] = "В работе",
-            ["closed"]      = "Закрыто",
+            ["closed"]      = "Закрыт",
         };
 
-        private static string Rect(double v) => v.ToString("F3", CultureInfo.InvariantCulture);
+        // Палитра под макет
+        private const string COL_BG        = "0.043 0.055 0.098 0.98";
+        private const string COL_CARD      = "0.078 0.094 0.153 1";
+        private const string COL_CARD_ALT  = "0.106 0.125 0.196 1";
+        private const string COL_ACCENT    = "0.145 0.388 0.921 1";
+        private const string COL_TEXT      = "0.91 0.93 0.98 1";
+        private const string COL_MUTED     = "0.55 0.60 0.71 1";
+        private const string COL_GREEN     = "0.20 0.83 0.60 1";
+        private const string COL_AMBER     = "0.98 0.75 0.14 1";
+        private const string COL_RED       = "0.94 0.27 0.27 1";
+
+        private static string Rect(double v) => v.ToString("F4", CultureInfo.InvariantCulture);
 
         private string GetReportStatusColor(ReportEntryData r)
         {
-            if (r.Status == "closed") return "0.55 0.55 0.55 1";
-            if (r.NeedsHelp) return "0.4 0.65 1 1";
-            if (r.IsPriority) return "1 0.35 0.35 1";
-            return "0.35 0.85 0.45 1";
+            if (r.Status == "closed") return COL_MUTED;
+            if (r.NeedsHelp) return COL_ACCENT;
+            if (r.IsPriority) return COL_RED;
+            if (r.Status == "in_progress") return COL_AMBER;
+            return COL_GREEN;
+        }
+
+        private static string ShortDate(string iso)
+        {
+            return DateTime.TryParse(iso, null, DateTimeStyles.RoundtripKind, out var dt)
+                ? dt.ToLocalTime().ToString("dd.MM HH:mm", CultureInfo.InvariantCulture)
+                : "";
+        }
+
+        private static string TimeOnly(string iso)
+        {
+            return DateTime.TryParse(iso, null, DateTimeStyles.RoundtripKind, out var dt)
+                ? dt.ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture)
+                : "";
+        }
+
+        private static string DayOnly(string iso)
+        {
+            return DateTime.TryParse(iso, null, DateTimeStyles.RoundtripKind, out var dt)
+                ? dt.ToLocalTime().ToString("d MMMM yyyy", CultureInfo.GetCultureInfo("ru-RU"))
+                : "";
+        }
+
+        private static string SubjectOf(ReportEntryData r)
+        {
+            if (!string.IsNullOrEmpty(r.Subject)) return r.Subject;
+            var first = r.Messages.FirstOrDefault(m => m.AuthorType == "player")?.Text ?? "";
+            return first.Length > 42 ? first.Substring(0, 42) + "…" : first;
         }
 
         /// <summary>
-        /// Фон обоих экранов /report. Если в data/Overpanel/images/REPORT_SCREEN.png
-        /// лежит картинка (разрешение 1202×805) — используется она (через FileStorage,
-        /// отдельным CuiRawImageComponent — Png на CuiPanel.Image в этой версии CUI API
-        /// не гарантирован), иначе сплошная заливка. Никакого интерфейса загрузки —
-        /// файл кладётся на сервер напрямую.
+        /// Корневая панель. Если в data/Overpanel/images/REPORT_SCREEN.png лежит
+        /// картинка (1202×805), она рисуется фоном; иначе — сплошная заливка.
         /// </summary>
-        private string AddReportBackgroundPanel(CuiElementContainer elements, string uiName)
+        private string AddReportRoot(CuiElementContainer elements, string uiName)
         {
             var panel = elements.Add(new CuiPanel
             {
-                Image = { Color = "0.05 0.05 0.05 0.97" },
-                RectTransform = { AnchorMin = "0.22 0.08", AnchorMax = "0.78 0.92" },
+                Image = { Color = COL_BG },
+                RectTransform = { AnchorMin = "0.13 0.09", AnchorMax = "0.87 0.91" },
                 CursorEnabled = true
             }, "Overlay", uiName);
 
@@ -2261,214 +2299,450 @@ namespace Oxide.Plugins
             return panel;
         }
 
-        internal void ShowReportListScreen(BasePlayer player)
+        /// <summary>Общая шапка: заголовок, «Правила», крестик.</summary>
+        private void AddReportHeader(CuiElementContainer elements, string parent)
         {
-            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
-            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
-            _openReportDetail.Remove(player.userID);
-
-            var reports = _reportListCache.TryGetValue(player.userID, out var list) ? list : new List<ReportEntryData>();
-
-            var elements = new CuiElementContainer();
-            var panel = AddReportBackgroundPanel(elements, REPORT_LIST_PANEL_UI);
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_ACCENT },
+                RectTransform = { AnchorMin = "0.018 0.905", AnchorMax = "0.052 0.975" }
+            }, parent);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = "МОИ ОБРАЩЕНИЯ", FontSize = 18, Align = TextAnchor.MiddleCenter, Color = "0.6 1 0.6 1" },
-                RectTransform = { AnchorMin = "0 0.91", AnchorMax = "1 1" }
-            }, panel);
+                Text = { Text = "Система репортов", FontSize = 19, Align = TextAnchor.LowerLeft, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.065 0.938", AnchorMax = "0.6 0.982" }
+            }, parent);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Связь с администрацией сервера", FontSize = 11, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                RectTransform = { AnchorMin = "0.065 0.9", AnchorMax = "0.6 0.938" }
+            }, parent);
 
             elements.Add(new CuiButton
             {
-                Button = { Command = "overpanel.report.close", Color = "0.3 0.1 0.1 1" },
-                RectTransform = { AnchorMin = "0.93 0.94", AnchorMax = "0.99 0.99" },
-                Text = { Text = "X", FontSize = 12, Align = TextAnchor.MiddleCenter }
-            }, panel);
+                Button = { Command = "overpanel.report.rules", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.845 0.918", AnchorMax = "0.94 0.972" },
+                Text = { Text = "? Правила", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = COL_TEXT }
+            }, parent);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.close", Color = "0 0 0 0" },
+                RectTransform = { AnchorMin = "0.95 0.918", AnchorMax = "0.985 0.972" },
+                Text = { Text = "✕", FontSize = 20, Align = TextAnchor.MiddleCenter, Color = COL_MUTED }
+            }, parent);
+        }
+
+        /// <summary>Левая колонка: кнопка создания и список обращений по секциям.</summary>
+        private void AddReportSidebar(CuiElementContainer elements, string parent, BasePlayer player, string activeId)
+        {
+            var reports = _reportListCache.TryGetValue(player.userID, out var list) ? list : new List<ReportEntryData>();
+            var open   = reports.Where(r => r.Status != "closed").ToList();
+            var closed = reports.Where(r => r.Status == "closed").ToList();
+
+            var side = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_CARD },
+                RectTransform = { AnchorMin = "0.018 0.02", AnchorMax = "0.325 0.885" }
+            }, parent);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.new", Color = COL_ACCENT },
+                RectTransform = { AnchorMin = "0.05 0.925", AnchorMax = "0.95 0.985" },
+                Text = { Text = "+  Создать репорт", FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+            }, side);
+
+            // Верстаем сверху вниз: заголовок секции, затем её карточки
+            var y = 0.9;
+            const double headerH = 0.045;
+            const double cardH   = 0.105;
+            const double gap     = 0.012;
+
+            void Section(string title, int count)
+            {
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = title, FontSize = 11, Align = TextAnchor.MiddleLeft, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = $"0.06 {Rect(y - headerH)}", AnchorMax = $"0.75 {Rect(y)}" }
+                }, side);
+
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = count.ToString(), FontSize = 11, Align = TextAnchor.MiddleRight, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = $"0.75 {Rect(y - headerH)}", AnchorMax = $"0.94 {Rect(y)}" }
+                }, side);
+
+                y -= headerH + gap;
+            }
+
+            void Card(ReportEntryData r)
+            {
+                if (y - cardH < 0.02) return; // место кончилось
+
+                var top = y;
+                var bottom = y - cardH;
+                var isActive = r.Id == activeId;
+
+                var card = elements.Add(new CuiButton
+                {
+                    Button = { Command = $"overpanel.report.open {r.Id}", Color = isActive ? "0.114 0.208 0.373 1" : COL_CARD_ALT },
+                    RectTransform = { AnchorMin = $"0.05 {Rect(bottom)}", AnchorMax = $"0.95 {Rect(top)}" },
+                    Text = { Text = "" }
+                }, side);
+
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = $"#{r.Id}", FontSize = 12, Align = TextAnchor.MiddleLeft, Color = isActive ? COL_ACCENT : COL_TEXT },
+                    RectTransform = { AnchorMin = "0.06 0.62", AnchorMax = "0.6 0.95" }
+                }, card);
+
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = ReportStatusLabel.TryGetValue(r.Status, out var st) ? st : r.Status,
+                             FontSize = 9, Align = TextAnchor.MiddleRight, Color = GetReportStatusColor(r) },
+                    RectTransform = { AnchorMin = "0.55 0.62", AnchorMax = "0.94 0.95" }
+                }, card);
+
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = SubjectOf(r), FontSize = 10, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = "0.06 0.28", AnchorMax = "0.94 0.62" }
+                }, card);
+
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = (r.Status == "closed" ? "Закрыт: " : "Создан: ") + ShortDate(r.CreatedAt),
+                             FontSize = 9, Align = TextAnchor.MiddleLeft, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = "0.06 0.04", AnchorMax = "0.94 0.28" }
+                }, card);
+
+                y = bottom - gap;
+            }
+
+            Section("Текущие обращения", open.Count);
+            foreach (var r in open.Take(4)) Card(r);
+
+            if (closed.Count > 0)
+            {
+                y -= gap;
+                Section("Прошлые обращения", closed.Count);
+                foreach (var r in closed.Take(3)) Card(r);
+            }
 
             if (reports.Count == 0)
             {
                 elements.Add(new CuiLabel
                 {
-                    Text = { Text = "Обращений пока нет.\n\nЧтобы создать: /report <ник или SteamID> <причина>",
-                             FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1" },
-                    RectTransform = { AnchorMin = "0.05 0.4", AnchorMax = "0.95 0.85" }
-                }, panel);
+                    Text = { Text = "Обращений пока нет", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = "0.05 0.7", AnchorMax = "0.95 0.85" }
+                }, side);
             }
-            else
-            {
-                const int maxRows = 8;
-                var shown = reports.Take(maxRows).ToList();
-                var rowHeight = 0.82 / shown.Count;
+        }
 
-                for (var i = 0; i < shown.Count; i++)
-                {
-                    var r = shown[i];
-                    var top = 0.87 - i * rowHeight;
-                    var bottom = top - rowHeight + 0.01;
-
-                    var row = elements.Add(new CuiButton
-                    {
-                        Button = { Command = $"overpanel.report.open {r.Id}", Color = "1 1 1 0.06" },
-                        RectTransform = { AnchorMin = $"0.04 {Rect(bottom)}", AnchorMax = $"0.96 {Rect(top)}" },
-                        Text = { Text = "" }
-                    }, panel);
-
-                    elements.Add(new CuiLabel
-                    {
-                        Text = { Text = r.Id, FontSize = 13, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
-                        RectTransform = { AnchorMin = "0.03 0", AnchorMax = "0.4 1" }
-                    }, row);
-
-                    elements.Add(new CuiLabel
-                    {
-                        Text = { Text = ReportStatusLabel.TryGetValue(r.Status, out var label) ? label : r.Status,
-                                 FontSize = 12, Align = TextAnchor.MiddleRight, Color = GetReportStatusColor(r) },
-                        RectTransform = { AnchorMin = "0.4 0", AnchorMax = "0.97 1" }
-                    }, row);
-                }
-            }
-
-            elements.Add(new CuiLabel
-            {
-                Text = { Text = "Новое обращение: /report <ник или SteamID> <причина>",
-                         FontSize = 10, Align = TextAnchor.MiddleCenter, Color = "0.6 0.6 0.6 1" },
-                RectTransform = { AnchorMin = "0 0.005", AnchorMax = "1 0.05" }
-            }, panel);
-
-            CuiHelper.AddUi(player, elements);
+        /// <summary>Правая колонка со списком, когда обращение не выбрано.</summary>
+        internal void ShowReportListScreen(BasePlayer player)
+        {
+            ShowReportScreen(player, null);
         }
 
         internal void ShowReportDetailScreen(BasePlayer player, string reportId)
         {
-            if (!_reportListCache.TryGetValue(player.userID, out var reports)) return;
-            var report = reports.FirstOrDefault(r => r.Id == reportId);
-            if (report == null) return;
+            ShowReportScreen(player, reportId);
+        }
 
+        /// <summary>Единый экран: сайдбар + область справа (переписка либо подсказка).</summary>
+        private void ShowReportScreen(BasePlayer player, string activeId)
+        {
             CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
             CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
-            _openReportDetail[player.userID] = reportId;
+
+            var reports = _reportListCache.TryGetValue(player.userID, out var list) ? list : new List<ReportEntryData>();
+            var report = activeId != null ? reports.FirstOrDefault(r => r.Id == activeId) : null;
+
+            if (report != null) _openReportDetail[player.userID] = report.Id;
+            else _openReportDetail.Remove(player.userID);
 
             var elements = new CuiElementContainer();
-            var panel = AddReportBackgroundPanel(elements, REPORT_DETAIL_PANEL_UI);
+            var root = AddReportRoot(elements, REPORT_LIST_PANEL_UI);
+            AddReportHeader(elements, root);
+            AddReportSidebar(elements, root, player, report?.Id);
 
-            elements.Add(new CuiButton
+            var pane = elements.Add(new CuiPanel
             {
-                Button = { Command = "overpanel.report.back", Color = "0.15 0.15 0.15 1" },
-                RectTransform = { AnchorMin = "0.02 0.94", AnchorMax = "0.16 0.99" },
-                Text = { Text = "< Назад", FontSize = 11, Align = TextAnchor.MiddleCenter }
-            }, panel);
+                Image = { Color = COL_CARD },
+                RectTransform = { AnchorMin = "0.34 0.02", AnchorMax = "0.982 0.885" }
+            }, root);
 
+            if (report == null)
+            {
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = reports.Count == 0
+                                ? "У вас ещё нет обращений.\nНажмите «Создать репорт», чтобы обратиться к администрации."
+                                : "Выберите обращение слева, чтобы открыть переписку.",
+                             FontSize = 13, Align = TextAnchor.MiddleCenter, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = "0.08 0.4", AnchorMax = "0.92 0.6" }
+                }, pane);
+
+                CuiHelper.AddUi(player, elements);
+                return;
+            }
+
+            // ── шапка обращения ──
             elements.Add(new CuiLabel
             {
-                Text = { Text = $"Обращение {report.Id}", FontSize = 16, Align = TextAnchor.MiddleCenter, Color = "0.6 1 0.6 1" },
-                RectTransform = { AnchorMin = "0.16 0.94", AnchorMax = "0.86 0.99" }
-            }, panel);
-
-            elements.Add(new CuiButton
-            {
-                Button = { Command = "overpanel.report.close", Color = "0.3 0.1 0.1 1" },
-                RectTransform = { AnchorMin = "0.93 0.94", AnchorMax = "0.99 0.99" },
-                Text = { Text = "X", FontSize = 12, Align = TextAnchor.MiddleCenter }
-            }, panel);
+                Text = { Text = $"Репорт #{report.Id}", FontSize = 16, Align = TextAnchor.LowerLeft, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.025 0.925", AnchorMax = "0.45 0.985" }
+            }, pane);
 
             elements.Add(new CuiLabel
             {
                 Text = { Text = ReportStatusLabel.TryGetValue(report.Status, out var statusLabel) ? statusLabel : report.Status,
-                         FontSize = 11, Align = TextAnchor.MiddleCenter, Color = GetReportStatusColor(report) },
-                RectTransform = { AnchorMin = "0.35 0.895", AnchorMax = "0.65 0.935" }
-            }, panel);
+                         FontSize = 10, Align = TextAnchor.LowerLeft, Color = GetReportStatusColor(report) },
+                RectTransform = { AnchorMin = "0.3 0.93", AnchorMax = "0.55 0.98" }
+            }, pane);
 
-            // ── переписка: последние сообщения, без прокрутки ──
-            const int maxMessages = 8;
-            var shownMessages = report.Messages.Count > maxMessages
-                ? report.Messages.Skip(report.Messages.Count - maxMessages).ToList()
-                : report.Messages;
-
-            if (shownMessages.Count == 0)
+            elements.Add(new CuiLabel
             {
-                elements.Add(new CuiLabel
-                {
-                    Text = { Text = "Сообщений пока нет.", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.6 0.6 0.6 1" },
-                    RectTransform = { AnchorMin = "0.05 0.5", AnchorMax = "0.95 0.6" }
-                }, panel);
-            }
-            else
-            {
-                const double msgAreaTop = 0.885;
-                const double msgAreaBottom = 0.26;
-                var rowHeight = (msgAreaTop - msgAreaBottom) / shownMessages.Count;
-
-                for (var i = 0; i < shownMessages.Count; i++)
-                {
-                    var m = shownMessages[i];
-                    var top = msgAreaTop - i * rowHeight;
-                    var bottom = top - rowHeight;
-                    var isPlayer = m.AuthorType == "player";
-
-                    elements.Add(new CuiLabel
-                    {
-                        Text =
-                        {
-                            Text = (isPlayer ? "Вы: " : "Администратор: ") + m.Text,
-                            FontSize = 12,
-                            Align = isPlayer ? TextAnchor.MiddleRight : TextAnchor.MiddleLeft,
-                            Color = isPlayer ? "0.85 0.85 1 1" : "0.7 1 0.7 1"
-                        },
-                        RectTransform = { AnchorMin = $"0.04 {Rect(bottom)}", AnchorMax = $"0.96 {Rect(top)}" }
-                    }, panel);
-                }
-            }
-
-            // ── поле ввода (Enter отправляет сообщение) ──
-            var inputBg = elements.Add(new CuiPanel
-            {
-                Image = { Color = "0 0 0 0.35" },
-                RectTransform = { AnchorMin = "0.04 0.155", AnchorMax = "0.96 0.235" }
-            }, panel);
-
-            elements.Add(new CuiElement
-            {
-                Parent = inputBg,
-                Components =
-                {
-                    new CuiInputFieldComponent
-                    {
-                        Command = $"overpanel.report.send {report.Id}",
-                        FontSize = 13,
-                        Color = "1 1 1 1",
-                        CharsLimit = 300,
-                        NeedsKeyboard = true,
-                        Align = TextAnchor.MiddleLeft,
-                        Text = "",
-                    },
-                    new CuiRectTransformComponent { AnchorMin = "0.01 0.05", AnchorMax = "0.99 0.95" }
-                }
-            });
+                Text = { Text = SubjectOf(report), FontSize = 11, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                RectTransform = { AnchorMin = "0.025 0.885", AnchorMax = "0.7 0.93" }
+            }, pane);
 
             if (report.Status != "closed")
             {
                 elements.Add(new CuiButton
                 {
-                    Button = { Command = $"overpanel.report.resolve {report.Id}", Color = "0.15 0.35 0.15 1" },
-                    RectTransform = { AnchorMin = "0.04 0.02", AnchorMax = "0.48 0.09" },
-                    Text = { Text = "Проблема решена", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.8 1 0.8 1" }
-                }, panel);
+                    Button = { Command = $"overpanel.report.resolve {report.Id}", Color = "0.35 0.11 0.11 1" },
+                    RectTransform = { AnchorMin = "0.735 0.925", AnchorMax = "0.975 0.985" },
+                    Text = { Text = "Закрыть обращение", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = COL_RED }
+                }, pane);
+            }
+
+            // ── лента сообщений ──
+            const int maxMessages = 5;
+            var shown = report.Messages.Count > maxMessages
+                ? report.Messages.Skip(report.Messages.Count - maxMessages).ToList()
+                : report.Messages;
+
+            const double feedTop = 0.865;
+            const double feedBottom = 0.135;
+
+            if (shown.Count == 0)
+            {
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = "Сообщений пока нет.", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = $"0.05 {Rect(feedBottom)}", AnchorMax = $"0.95 {Rect(feedTop)}" }
+                }, pane);
+            }
+            else
+            {
+                // Разделитель с датой первого показанного сообщения
+                elements.Add(new CuiLabel
+                {
+                    Text = { Text = DayOnly(shown[0].CreatedAt), FontSize = 10, Align = TextAnchor.MiddleCenter, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = $"0.05 {Rect(feedTop - 0.045)}", AnchorMax = $"0.95 {Rect(feedTop)}" }
+                }, pane);
+
+                var areaTop = feedTop - 0.055;
+                var rowH = (areaTop - feedBottom) / shown.Count;
+
+                for (var i = 0; i < shown.Count; i++)
+                {
+                    var m = shown[i];
+                    var top = areaTop - i * rowH;
+                    var bottom = top - rowH + 0.008;
+                    var isPlayer = m.AuthorType == "player";
+                    var isSystem = m.AuthorType == "system";
+
+                    var authorName = isPlayer ? "Вы" : isSystem ? "Система" : "Администратор";
+                    var authorColor = isPlayer ? COL_TEXT : isSystem ? COL_ACCENT : COL_GREEN;
+
+                    // Аватар-заглушка: кружок с первой буквой роли
+                    var avatar = elements.Add(new CuiPanel
+                    {
+                        Image = { Color = isPlayer ? COL_CARD_ALT : isSystem ? "0.09 0.16 0.30 1" : "0.10 0.26 0.20 1" },
+                        RectTransform = { AnchorMin = $"0.025 {Rect(bottom)}", AnchorMax = $"0.065 {Rect(top)}" }
+                    }, pane);
+
+                    elements.Add(new CuiLabel
+                    {
+                        Text = { Text = isPlayer ? "И" : isSystem ? "S" : "A", FontSize = 12,
+                                 Align = TextAnchor.MiddleCenter, Color = authorColor },
+                        RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" }
+                    }, avatar);
+
+                    var bubble = elements.Add(new CuiPanel
+                    {
+                        Image = { Color = COL_CARD_ALT },
+                        RectTransform = { AnchorMin = $"0.075 {Rect(bottom)}", AnchorMax = $"0.975 {Rect(top)}" }
+                    }, pane);
+
+                    elements.Add(new CuiLabel
+                    {
+                        Text = { Text = $"{authorName}   {TimeOnly(m.CreatedAt)}", FontSize = 10,
+                                 Align = TextAnchor.UpperLeft, Color = authorColor },
+                        RectTransform = { AnchorMin = "0.015 0.62", AnchorMax = "0.98 0.97" }
+                    }, bubble);
+
+                    elements.Add(new CuiLabel
+                    {
+                        Text = { Text = m.Text, FontSize = 11, Align = TextAnchor.UpperLeft, Color = COL_TEXT },
+                        RectTransform = { AnchorMin = "0.015 0.05", AnchorMax = "0.98 0.62" }
+                    }, bubble);
+                }
+            }
+
+            // ── строка ввода ──
+            if (report.Status != "closed")
+            {
+                elements.Add(new CuiButton
+                {
+                    Button = { Command = "overpanel.report.attach", Color = COL_CARD_ALT },
+                    RectTransform = { AnchorMin = "0.025 0.03", AnchorMax = "0.075 0.115" },
+                    Text = { Text = "📎", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = COL_MUTED }
+                }, pane);
+
+                var inputBg = elements.Add(new CuiPanel
+                {
+                    Image = { Color = COL_CARD_ALT },
+                    RectTransform = { AnchorMin = "0.085 0.03", AnchorMax = "0.775 0.115" }
+                }, pane);
+
+                elements.Add(new CuiElement
+                {
+                    Parent = inputBg,
+                    Components =
+                    {
+                        new CuiInputFieldComponent
+                        {
+                            Command = $"overpanel.report.send {report.Id}",
+                            FontSize = 12,
+                            Color = COL_TEXT,
+                            CharsLimit = 400,
+                            NeedsKeyboard = true,
+                            Align = TextAnchor.MiddleLeft,
+                            Text = "",
+                        },
+                        new CuiRectTransformComponent { AnchorMin = "0.015 0.05", AnchorMax = "0.985 0.95" }
+                    }
+                });
 
                 elements.Add(new CuiButton
                 {
                     Button = { Command = $"overpanel.report.urgent {report.Id}", Color = "0.35 0.15 0.15 1" },
-                    RectTransform = { AnchorMin = "0.52 0.02", AnchorMax = "0.96 0.09" },
-                    Text = { Text = "Проблема актуальна", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 0.85 0.85 1" }
-                }, panel);
+                    RectTransform = { AnchorMin = "0.785 0.03", AnchorMax = "0.975 0.115" },
+                    Text = { Text = "Проблема актуальна", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "1 0.85 0.85 1" }
+                }, pane);
             }
             else
             {
                 elements.Add(new CuiLabel
                 {
-                    Text = { Text = "Обращение закрыто", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.6 0.6 0.6 1" },
-                    RectTransform = { AnchorMin = "0.04 0.02", AnchorMax = "0.96 0.09" }
-                }, panel);
+                    Text = { Text = "Обращение закрыто. Напишите новое, если проблема повторилась.",
+                             FontSize = 11, Align = TextAnchor.MiddleCenter, Color = COL_MUTED },
+                    RectTransform = { AnchorMin = "0.025 0.03", AnchorMax = "0.975 0.115" }
+                }, pane);
             }
+
+            CuiHelper.AddUi(player, elements);
+        }
+
+        /// <summary>Экран выбора категории при создании обращения.</summary>
+        private void ShowReportCreateScreen(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+
+            var elements = new CuiElementContainer();
+            var root = AddReportRoot(elements, REPORT_DETAIL_PANEL_UI);
+            AddReportHeader(elements, root);
+
+            var pane = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_CARD },
+                RectTransform = { AnchorMin = "0.018 0.02", AnchorMax = "0.982 0.885" }
+            }, root);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Новое обращение — выберите категорию", FontSize = 15, Align = TextAnchor.MiddleLeft, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.03 0.9", AnchorMax = "0.7 0.97" }
+            }, pane);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.back", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.8 0.9", AnchorMax = "0.97 0.965" },
+                Text = { Text = "< Назад", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = COL_TEXT }
+            }, pane);
+
+            var y = 0.85;
+            const double h = 0.085;
+            for (var i = 0; i < ReportCategories.Length; i++)
+            {
+                elements.Add(new CuiButton
+                {
+                    // Индекс, а не текст: пробелы и скобки в аргументе консольной команды ломают разбор
+                    Button = { Command = $"overpanel.report.category {i}", Color = COL_CARD_ALT },
+                    RectTransform = { AnchorMin = $"0.03 {Rect(y - h)}", AnchorMax = $"0.62 {Rect(y)}" },
+                    Text = { Text = ReportCategories[i], FontSize = 12, Align = TextAnchor.MiddleLeft, Color = COL_TEXT }
+                }, pane);
+                y -= h + 0.015;
+            }
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "После выбора категории опишите проблему одним сообщением.\n\n"
+                              + "Доказательства: загрузите видео на Яндекс.Диск или Dropbox\n"
+                              + "и вставьте ссылку прямо в текст сообщения.",
+                         FontSize = 11, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                RectTransform = { AnchorMin = "0.65 0.45", AnchorMax = "0.97 0.85" }
+            }, pane);
+
+            CuiHelper.AddUi(player, elements);
+        }
+
+        /// <summary>Подсказка по вложениям (загрузить файл из игры нельзя).</summary>
+        private void ShowReportAttachHelp(BasePlayer player)
+        {
+            const string ui = "overpanel.report.attachhelp";
+            CuiHelper.DestroyUi(player, ui);
+
+            var elements = new CuiElementContainer();
+            var panel = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_CARD },
+                RectTransform = { AnchorMin = "0.3 0.34", AnchorMax = "0.7 0.66" },
+                CursorEnabled = true
+            }, "Overlay", ui);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Как приложить доказательства", FontSize = 15, Align = TextAnchor.MiddleCenter, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.05 0.82", AnchorMax = "0.95 0.95" }
+            }, panel);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Загрузить файл прямо из игры нельзя.\n\n"
+                              + "1. Загрузите видео или скриншот на Яндекс.Диск либо Dropbox\n"
+                              + "2. Откройте доступ по ссылке\n"
+                              + "3. Вставьте ссылку в сообщение — она прикрепится к обращению\n\n"
+                              + "Ссылку Dropbox панель сама переведёт в прямую загрузку.",
+                         FontSize = 11, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                RectTransform = { AnchorMin = "0.07 0.22", AnchorMax = "0.93 0.8" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.attachclose", Color = COL_ACCENT },
+                RectTransform = { AnchorMin = "0.35 0.06", AnchorMax = "0.65 0.18" },
+                Text = { Text = "Понятно", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+            }, panel);
 
             CuiHelper.AddUi(player, elements);
         }
@@ -2488,6 +2762,55 @@ namespace Oxide.Plugins
             if (player != null) ShowReportListScreen(player);
         }
 
+        [ConsoleCommand("overpanel.report.new")]
+        private void CmdReportNew(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowReportCreateScreen(player);
+        }
+
+        [ConsoleCommand("overpanel.report.category")]
+        private void CmdReportCategory(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null || arg.Args == null || arg.Args.Length < 1) return;
+            if (!int.TryParse(arg.GetString(0), out var index)) return;
+            if (index < 0 || index >= ReportCategories.Length) return;
+
+            _pendingReportCategory[player.userID] = ReportCategories[index];
+
+            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+
+            SendReply(player,
+                $"<color=#5599FF>[Overpanel]</color> Категория: {ReportCategories[index]}.\n" +
+                "Опишите проблему командой: /report <текст>. Ссылку на доказательства можно вставить прямо в текст.");
+        }
+
+        [ConsoleCommand("overpanel.report.rules")]
+        private void CmdReportRulesFromCui(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+            ShowRulesScreen(player, GetServerRules());
+        }
+
+        [ConsoleCommand("overpanel.report.attach")]
+        private void CmdReportAttach(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowReportAttachHelp(player);
+        }
+
+        [ConsoleCommand("overpanel.report.attachclose")]
+        private void CmdReportAttachClose(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) CuiHelper.DestroyUi(player, "overpanel.report.attachhelp");
+        }
+
         [ConsoleCommand("overpanel.report.close")]
         private void CmdReportCloseScreen(ConsoleSystem.Arg arg)
         {
@@ -2495,6 +2818,7 @@ namespace Oxide.Plugins
             if (player == null) return;
             CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
             CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+            CuiHelper.DestroyUi(player, "overpanel.report.attachhelp");
             _openReportDetail.Remove(player.userID);
         }
 
@@ -2538,6 +2862,7 @@ namespace Oxide.Plugins
                 CuiHelper.DestroyUi(player, RESTART_PANEL_UI);
                 CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
                 CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+                CuiHelper.DestroyUi(player, "overpanel.report.attachhelp");
                 CuiHelper.DestroyUi(player, RULES_PANEL_UI);
             }
             _restartCountdownTimer?.Destroy();
@@ -2588,6 +2913,7 @@ namespace Oxide.Plugins
         private class ReportEntryData
         {
             [JsonProperty("id")] public string Id;
+            [JsonProperty("subject")] public string Subject;
             [JsonProperty("status")] public string Status;
             [JsonProperty("is_priority")] public bool IsPriority;
             [JsonProperty("needs_help")] public bool NeedsHelp;
@@ -2595,10 +2921,24 @@ namespace Oxide.Plugins
             [JsonProperty("messages")] public List<ReportMessageData> Messages = new List<ReportMessageData>();
         }
 
+        /// <summary>Категории для экрана «Создать репорт».</summary>
+        private static readonly string[] ReportCategories =
+        {
+            "Читер (aim / подозрительная игра)",
+            "Читер (ESP / видит сквозь стены)",
+            "Оскорбления в чате",
+            "Застрял в текстурах",
+            "Баг / проблема сервера",
+            "Другое",
+        };
+
         private readonly Dictionary<ulong, List<ReportEntryData>> _reportListCache = new Dictionary<ulong, List<ReportEntryData>>();
         private readonly Dictionary<string, ulong> _reportListRequests = new Dictionary<string, ulong>();
         private readonly Dictionary<ulong, string> _openReportDetail = new Dictionary<ulong, string>();
         private readonly Dictionary<ulong, string> _pendingOpenReportId = new Dictionary<ulong, string>();
+
+        /// Категория, выбранная на экране создания — прикрепится к следующему /report игрока.
+        private readonly Dictionary<ulong, string> _pendingReportCategory = new Dictionary<ulong, string>();
 
         // ── /report ──────────────────────────────────────────────────
 
@@ -2652,12 +2992,21 @@ namespace Oxide.Plugins
                 _playerReportCounts[author.UserIDString] = 0;
             _playerReportCounts[author.UserIDString]++;
 
+            // Категория выбрана на CUI-экране создания и ждала описания проблемы
+            string subject = null;
+            if (_pendingReportCategory.TryGetValue(author.userID, out var chosen))
+            {
+                subject = chosen;
+                _pendingReportCategory.Remove(author.userID);
+            }
+
             SendEvent("report.created", new Dictionary<string, object>
             {
                 ["author_steamid"] = author.UserIDString,
                 ["author_name"]    = author.displayName,
                 ["target_steamid"] = targetId,
                 ["text"]           = text,
+                ["subject"]        = subject,
                 ["attachments"]    = attachments,
             });
 
