@@ -368,11 +368,9 @@ namespace Oxide.Plugins
                 return;
             }
 
-            // .ToString() принудительно материализует string перед .ToUpperInvariant() —
-            // после свежего обновления рантайма Rust компилятор без него подхватывает
-            // MemoryExtensions.ToUpperInvariant(ReadOnlySpan<char>, Span<char>) через
-            // неявную конверсию string→ReadOnlySpan<char> и требует лишний параметр destination.
-            var code = arg.Args[0].Trim().ToString().ToUpperInvariant();
+            // arg.Args — Facepunch.StringView[], не string[] (после обновления рантайма Rust).
+            // arg.GetString(i) — правильный способ получить настоящий string.
+            var code = arg.GetString(0).Trim().ToUpperInvariant();
             if (code.Length != 6)
             {
                 arg.ReplyWith("Код должен состоять из 6 символов.");
@@ -2480,7 +2478,7 @@ namespace Oxide.Plugins
         {
             var player = arg.Player();
             if (player == null || arg.Args == null || arg.Args.Length < 1) return;
-            ShowReportDetailScreen(player, arg.Args[0]);
+            ShowReportDetailScreen(player, arg.GetString(0));
         }
 
         [ConsoleCommand("overpanel.report.back")]
@@ -2505,7 +2503,7 @@ namespace Oxide.Plugins
         {
             var player = arg.Player();
             if (player == null || arg.Args == null || arg.Args.Length < 1) return;
-            MarkReportResolved(player, arg.Args[0]);
+            MarkReportResolved(player, arg.GetString(0));
         }
 
         [ConsoleCommand("overpanel.report.urgent")]
@@ -2513,7 +2511,7 @@ namespace Oxide.Plugins
         {
             var player = arg.Player();
             if (player == null || arg.Args == null || arg.Args.Length < 1) return;
-            MarkReportUrgent(player, arg.Args[0]);
+            MarkReportUrgent(player, arg.GetString(0));
         }
 
         [ConsoleCommand("overpanel.report.send")]
@@ -2522,8 +2520,11 @@ namespace Oxide.Plugins
             var player = arg.Player();
             if (player == null || arg.Args == null || arg.Args.Length < 1) return;
 
-            var reportId = arg.Args[0];
-            var text = arg.Args.Length > 1 ? string.Join(" ", arg.Args, 1, arg.Args.Length - 1) : "";
+            var reportId = arg.GetString(0);
+            var words = new List<string>();
+            for (var i = 1; i < arg.Args.Length; i++) words.Add(arg.GetString(i));
+            var text = string.Join(" ", words);
+
             SendReportMessage(player, reportId, text);
         }
 
