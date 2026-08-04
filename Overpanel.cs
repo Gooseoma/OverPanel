@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.0.4")]
+    [Info("Overpanel", "Gooseoma", "1.0.5")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -162,7 +162,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.4";
+        internal const string PLUGIN_VERSION = "1.0.5";
 
         internal PluginConfig _config;
 
@@ -3368,9 +3368,10 @@ namespace Oxide.Plugins
 
         private void HandleActionRconExec(JObject msg, string requestId)
         {
-            var command    = msg["command"]?.ToString();
-            var adminId    = msg["admin_steamid"]?.ToString();
-            var adminTitle = msg["admin_title"]?.ToString() ?? "Администратор";
+            // admin_steamid/admin_title раньше уходили только в LogRconExecution —
+            // с тех пор как объединённую запись "команда + ответ" пишет бэкенд
+            // при получении rcon.output, они плагину больше не нужны.
+            var command = msg["command"]?.ToString();
 
             if (string.IsNullOrEmpty(command))
             {
@@ -3399,8 +3400,9 @@ namespace Oxide.Plugins
                     _rconCapture = null;
                 }
 
+                // Лог со связкой "команда + ответ" пишет бэкенд при получении rcon.output —
+                // здесь достаточно отправить сам вывод.
                 SendRconOutput(requestId, $"Ошибка выполнения: {ex.Message}", final: true, stream: "stderr");
-                LogRconExecution(command, adminId, adminTitle, success: false);
                 return;
             }
 
@@ -3415,8 +3417,6 @@ namespace Oxide.Plugins
             // Даём команде время дописать асинхронный вывод в консоль
             _rconFlushTimer?.Destroy();
             _rconFlushTimer = timer.Once(RCON_CAPTURE_WINDOW_MS / 1000f, () => FinishRconCapture(requestId));
-
-            LogRconExecution(command, adminId, adminTitle, success: true);
         }
 
         private void FinishRconCapture(string requestId)
@@ -3450,20 +3450,6 @@ namespace Oxide.Plugins
                 ["stream"]     = stream,
                 ["final"]      = final,
             }, requestId);
-        }
-
-        private void LogRconExecution(string command, string adminId, string adminTitle, bool success)
-        {
-            SendEvent("log.action", new Dictionary<string, object>
-            {
-                ["log_type"]       = "rcon",
-                ["actor_steamid"]  = adminId,
-                ["actor_title"]    = adminTitle,
-                ["description"]    = success
-                    ? $"Выполнена RCON-команда: {command}"
-                    : $"Ошибка RCON-команды: {command}",
-                ["meta"] = new Dictionary<string, object> { ["command"] = command },
-            });
         }
 
         // ── Перехват вывода консоли ──────────────────────────────────
