@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.0.3")]
+    [Info("Overpanel", "Gooseoma", "1.0.4")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -131,7 +131,26 @@ namespace Oxide.Plugins
                 ["plugin_version"] = PLUGIN_VERSION,
                 // Нужно панели, чтобы перевести x/z из player.position_batch в проценты на карте
                 ["world_size"]     = ConVar.Server.worldsize,
+                // Имя могли сменить после привязки — держим панель в курсе
+                ["name"]           = GetEffectiveServerName(),
             });
+        }
+
+        /// <summary>
+        /// Имя сервера для панели. ServerName в конфиге имеет дефолт "My Rust Server"
+        /// и никогда не бывает null, поэтому раньше реальный hostname не подхватывался
+        /// вообще — сервер так и висел в панели под дефолтным именем.
+        /// </summary>
+        internal string GetEffectiveServerName()
+        {
+            var configured = _config?.ServerName;
+            var isDefault = string.IsNullOrWhiteSpace(configured)
+                            || configured == "My Rust Server";
+
+            if (!isDefault) return configured;
+
+            var hostname = ConVar.Server.hostname;
+            return string.IsNullOrWhiteSpace(hostname) ? "Rust Server" : hostname;
         }
 
         internal string GetPlayerIp(BasePlayer player)
@@ -143,7 +162,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.3";
+        internal const string PLUGIN_VERSION = "1.0.4";
 
         internal PluginConfig _config;
 
@@ -381,7 +400,7 @@ namespace Oxide.Plugins
             var payload = JsonConvert.SerializeObject(new
             {
                 code,
-                name          = _config?.ServerName ?? ConVar.Server.hostname,
+                name          = GetEffectiveServerName(),
                 ip            = GetServerIp(),
                 port          = ConVar.Server.port,
                 pluginVersion = PLUGIN_VERSION,
@@ -1055,7 +1074,23 @@ namespace Oxide.Plugins
             public HashSet<string> SteamIds { get; set; } = new HashSet<string>();
         }
 
+        // Один экземпляр плагина обслуживает ровно один сервер, поэтому состояние
+        // всегда лежит под одним ключом. Раньше панель писала его под ключ serverId,
+        // а CanUserLogin читал "local" — проверка входа смотрела на устаревшее
+        // состояние из файла, и добавленный в whitelist игрок всё равно получал кик.
+        private const string ACCESS_LIST_KEY = "local";
+
         private Dictionary<string, AccessListState> _accessListByServer = new Dictionary<string, AccessListState>();
+
+        private AccessListState GetAccessListState()
+        {
+            if (!_accessListByServer.TryGetValue(ACCESS_LIST_KEY, out var state))
+            {
+                state = new AccessListState();
+                _accessListByServer[ACCESS_LIST_KEY] = state;
+            }
+            return state;
+        }
 
         // Schedules
         private List<AccessScheduleEntry> _schedules = new List<AccessScheduleEntry>();
@@ -1077,17 +1112,20 @@ namespace Oxide.Plugins
             LoadAccessListFromBackend();
         }
 
+        /// <summary>
+        /// Локальный кэш на случай, если панель ещё не прислала accesslist.update
+        /// (сервер поднялся раньше бэкенда). Как только придёт синхронизация,
+        /// состояние перезапишется актуальным.
+        /// </summary>
         private void LoadAccessListFromBackend()
         {
-            // Populated via WebSocket sync from backend
-            // Stub: loads from local file if available
             try
             {
                 var state = Interface.Oxide.DataFileSystem.ReadObject<AccessListState>("Overpanel/accesslist");
                 if (state != null)
-                    _accessListByServer["local"] = state;
+                    _accessListByServer[ACCESS_LIST_KEY] = state;
             }
-            catch { }
+            catch { /* файла ещё нет — работаем с пустым состоянием */ }
         }
 
         private void CheckSchedules()
@@ -1103,19 +1141,18 @@ namespace Oxide.Plugins
                 bool inWindow = string.CompareOrdinal(timeStr, schedule.Start) >= 0 &&
                                 string.CompareOrdinal(timeStr, schedule.End) <= 0;
 
-                if (_accessListByServer.TryGetValue(schedule.ServerId ?? "local", out var state))
+                var state = GetAccessListState();
+
+                // Расписание только включает/выключает ограничение, сам список не трогает
+                if (inWindow && state.Mode == "none")
                 {
-                    // Schedule control enables/disables access restriction
-                    if (inWindow && state.Mode == "none")
-                    {
-                        state.Mode = "whitelist";
-                        Puts("[Overpanel][AccessList] Schedule: whitelist mode activated");
-                    }
-                    else if (!inWindow && state.Mode == "whitelist")
-                    {
-                        state.Mode = "none";
-                        Puts("[Overpanel][AccessList] Schedule: whitelist mode deactivated");
-                    }
+                    state.Mode = "whitelist";
+                    Puts("[Overpanel][AccessList] По расписанию включён whitelist");
+                }
+                else if (!inWindow && state.Mode == "whitelist")
+                {
+                    state.Mode = "none";
+                    Puts("[Overpanel][AccessList] По расписанию whitelist выключен");
                 }
             }
         }
@@ -1124,7 +1161,7 @@ namespace Oxide.Plugins
         {
             if (!_config.Modules.AccessList) return null;
 
-            if (!_accessListByServer.TryGetValue("local", out var state)) return null;
+            var state = GetAccessListState();
 
             if (state.Mode == "whitelist" && !state.SteamIds.Contains(id))
                 return "Сервер закрыт. Вас нет в whitelist.";
@@ -1142,19 +1179,15 @@ namespace Oxide.Plugins
                 Mode = mode,
                 SteamIds = new HashSet<string>(steamIds),
             };
-            _accessListByServer[serverId ?? "local"] = state;
+            _accessListByServer[ACCESS_LIST_KEY] = state;
 
             Interface.Oxide.DataFileSystem.WriteObject("Overpanel/accesslist", state);
-            Puts($"[Overpanel][AccessList] Updated: mode={mode}, count={steamIds.Count}");
+            Puts($"[Overpanel][AccessList] Обновлён: режим={mode}, записей={steamIds.Count}");
         }
 
         internal void AddToAccessList(string serverId, string steamId, string mode)
         {
-            if (!_accessListByServer.TryGetValue(serverId ?? "local", out var state))
-            {
-                state = new AccessListState { Mode = mode };
-                _accessListByServer[serverId ?? "local"] = state;
-            }
+            var state = GetAccessListState();
             state.SteamIds.Add(steamId);
             state.Mode = mode;
             Interface.Oxide.DataFileSystem.WriteObject("Overpanel/accesslist", state);
@@ -1162,10 +1195,7 @@ namespace Oxide.Plugins
 
         internal void RemoveFromAccessList(string serverId, string steamId)
         {
-            var key = serverId ?? "local";
-
-            if (!_accessListByServer.TryGetValue(key, out var state)) return;
-
+            var state = GetAccessListState();
             state.SteamIds.Remove(steamId);
             Interface.Oxide.DataFileSystem.WriteObject("Overpanel/accesslist", state);
         }
