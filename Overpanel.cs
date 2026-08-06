@@ -162,7 +162,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.5";
+        internal const string PLUGIN_VERSION = "1.0.6";
 
         internal PluginConfig _config;
 
@@ -1128,12 +1128,23 @@ namespace Oxide.Plugins
             catch { /* файла ещё нет — работаем с пустым состоянием */ }
         }
 
+        // Раньше расписание писало прямо в state.Mode: это (а) включало whitelist
+        // с пустым SteamIds, если реальный режим с панели был "none" без записей —
+        // кикало вообще всех, и (б) при выходе из окна безусловно сбрасывало
+        // state.Mode в "none", затирая настоящий whitelist/blacklist с панели,
+        // если он случайно совпал со значением "whitelist". Теперь расписание —
+        // отдельный флаг поверх состояния с панели, а не замена ему: оно может
+        // только ДОБАВИТЬ whitelist-ограничение по уже существующим записям и
+        // никогда не трогает Mode/SteamIds, синхронизированные с бэкенда.
+        private bool _scheduleWhitelistWindow = false;
+
         private void CheckSchedules()
         {
             var now = DateTime.Now;
             int dayOfWeek = (int)now.DayOfWeek;
             string timeStr = now.ToString("HH:mm");
 
+            bool inAnyWindow = false;
             foreach (var schedule in _schedules)
             {
                 if (!schedule.Days.Contains(dayOfWeek)) continue;
@@ -1141,19 +1152,19 @@ namespace Oxide.Plugins
                 bool inWindow = string.CompareOrdinal(timeStr, schedule.Start) >= 0 &&
                                 string.CompareOrdinal(timeStr, schedule.End) <= 0;
 
-                var state = GetAccessListState();
+                if (inWindow)
+                {
+                    inAnyWindow = true;
+                    break;
+                }
+            }
 
-                // Расписание только включает/выключает ограничение, сам список не трогает
-                if (inWindow && state.Mode == "none")
-                {
-                    state.Mode = "whitelist";
-                    Puts("[Overpanel][AccessList] По расписанию включён whitelist");
-                }
-                else if (!inWindow && state.Mode == "whitelist")
-                {
-                    state.Mode = "none";
-                    Puts("[Overpanel][AccessList] По расписанию whitelist выключен");
-                }
+            if (inAnyWindow != _scheduleWhitelistWindow)
+            {
+                _scheduleWhitelistWindow = inAnyWindow;
+                Puts(_scheduleWhitelistWindow
+                    ? "[Overpanel][AccessList] По расписанию включён whitelist"
+                    : "[Overpanel][AccessList] По расписанию whitelist выключен");
             }
         }
 
@@ -1163,7 +1174,12 @@ namespace Oxide.Plugins
 
             var state = GetAccessListState();
 
-            if (state.Mode == "whitelist" && !state.SteamIds.Contains(id))
+            // Расписание только усиливает ограничение по уже существующему списку —
+            // пустой список по расписанию никого не кикает, а не форсит закрытие сервера
+            bool whitelistActive = state.Mode == "whitelist"
+                || (_scheduleWhitelistWindow && state.SteamIds.Count > 0);
+
+            if (whitelistActive && !state.SteamIds.Contains(id))
                 return "Сервер закрыт. Вас нет в whitelist.";
 
             if (state.Mode == "blacklist" && state.SteamIds.Contains(id))
