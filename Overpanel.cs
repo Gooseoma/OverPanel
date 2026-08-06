@@ -162,7 +162,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.7";
+        internal const string PLUGIN_VERSION = "1.0.8";
 
         internal PluginConfig _config;
 
@@ -248,6 +248,10 @@ namespace Oxide.Plugins
                 case "max_warns":          if (int.TryParse(value?.ToString(), out var maxWarns)) _config.MaxWarningsBeforeMute = maxWarns; break;
                 case "appeal_name":        _config.AppealServiceName = value?.ToString(); break;
                 case "appeal_url":         _config.AppealServiceUrl = value?.ToString(); break;
+                // Панельная настройка сервера, а не файловый конфиг — в _config не пишем
+                case "improved_reports":
+                    bool.TryParse(value?.ToString(), out _improvedReports);
+                    return;
             }
             SaveConfig();
         }
@@ -1305,7 +1309,7 @@ namespace Oxide.Plugins
             IncrementRecap("bans");
 
             ChatAlert($"<color=#FF4444>БАН:</color> {targetName} заблокирован администратором " +
-                      $"<color=#66ff66>{adminTitle}</color>. Причина: {reason}" +
+                      $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
                       (duration > 0 ? $" ({FormatDuration(duration)})" : " (навсегда)"));
 
             SendEvent("punishment.issued", new Dictionary<string, object>
@@ -1372,7 +1376,7 @@ namespace Oxide.Plugins
             IncrementRecap("mutes");
 
             ChatAlert($"<color=#FFAA00>МУТ:</color> {targetName} замучен администратором " +
-                      $"<color=#66ff66>{adminTitle}</color>. Причина: {reason}" +
+                      $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
                       (durationSeconds > 0 ? $" ({FormatDuration(durationSeconds)})" : " (навсегда)"));
 
             SendEvent("punishment.issued", new Dictionary<string, object>
@@ -2276,6 +2280,7 @@ namespace Oxide.Plugins
         private const string COL_ACCENT    = "0.145 0.388 0.921 1";
         private const string COL_TEXT      = "0.91 0.93 0.98 1";
         private const string COL_MUTED     = "0.55 0.60 0.71 1";
+        private const string COL_BORDER    = "0.20 0.23 0.31 1";
         private const string COL_GREEN     = "0.20 0.83 0.60 1";
         private const string COL_AMBER     = "0.98 0.75 0.14 1";
         private const string COL_RED       = "0.94 0.27 0.27 1";
@@ -2351,22 +2356,25 @@ namespace Oxide.Plugins
         /// <summary>Общая шапка: заголовок, «Правила», крестик.</summary>
         private void AddReportHeader(CuiElementContainer elements, string parent)
         {
-            elements.Add(new CuiPanel
-            {
-                Image = { Color = COL_ACCENT },
-                RectTransform = { AnchorMin = "0.018 0.905", AnchorMax = "0.052 0.975" }
-            }, parent);
-
+            // Акцентный квадрат перед заголовком убран — читался как случайный
+            // логотип и только съедал место, текст теперь начинается от края.
             elements.Add(new CuiLabel
             {
-                Text = { Text = "Система репортов", FontSize = 19, Align = TextAnchor.LowerLeft, Color = COL_TEXT },
-                RectTransform = { AnchorMin = "0.065 0.938", AnchorMax = "0.6 0.982" }
+                Text = { Text = "Система репортов", FontSize = 20, Align = TextAnchor.LowerLeft, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.03 0.938", AnchorMax = "0.6 0.982" }
             }, parent);
 
             elements.Add(new CuiLabel
             {
                 Text = { Text = "Связь с администрацией сервера", FontSize = 11, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
-                RectTransform = { AnchorMin = "0.065 0.9", AnchorMax = "0.6 0.938" }
+                RectTransform = { AnchorMin = "0.03 0.9", AnchorMax = "0.6 0.938" }
+            }, parent);
+
+            // Тонкий разделитель под шапкой — отделяет её от контента
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_BORDER },
+                RectTransform = { AnchorMin = "0.03 0.892", AnchorMax = "0.97 0.8935" }
             }, parent);
 
             elements.Add(new CuiButton
@@ -2989,6 +2997,14 @@ namespace Oxide.Plugins
         /// Категория, выбранная на экране создания — прикрепится к следующему /report игрока.
         private readonly Dictionary<ulong, string> _pendingReportCategory = new Dictionary<ulong, string>();
 
+        /// <summary>
+        /// Настройка «Улучшенные репорты» конкретного сервера — приходит из панели
+        /// через config.update (improved_reports). Выключено → /report работает
+        /// как обычная чат-команда без CUI. По умолчанию false: совпадает с
+        /// дефолтом Server.improvedReports в БД панели.
+        /// </summary>
+        private bool _improvedReports = false;
+
         // ── /report ──────────────────────────────────────────────────
 
         private void CmdReport(IPlayer player, string command, string[] args)
@@ -3002,35 +3018,30 @@ namespace Oxide.Plugins
             var basePlayer = player.Object as BasePlayer;
             if (basePlayer == null) return;
 
-            if (args.Length == 0)
-            {
-                RequestReportList(basePlayer);
-                return;
-            }
+            // Весь текст после /report — это описание проблемы целиком.
+            // Раньше первое слово молча съедалось как <цель> и требовалось минимум
+            // 2 аргумента, поэтому "/report тут читер" уходил целью "тут", а
+            // "/report читер" не создавал вообще ничего — обращения не доходили
+            // до панели, хотя сам CUI подсказывал именно синтаксис "/report <текст>".
+            var text = args.Length > 0 ? string.Join(" ", args).Trim() : null;
 
-            if (args.Length < 2)
+            if (string.IsNullOrEmpty(text))
             {
-                player.Reply("[Overpanel] Использование: /report <SteamID или имя> <причина>");
+                // Без текста: с улучшенными репортами открываем CUI, без них —
+                // подсказываем чат-синтаксис, чтобы экран вообще не появлялся.
+                if (_improvedReports)
+                {
+                    RequestReportList(basePlayer);
+                    return;
+                }
+
+                player.Reply("[Overpanel] Использование: /report <текст обращения>");
+                player.Reply("[Overpanel] Например: /report тут читер");
                 player.Reply("[Overpanel] Ссылку на доказательства можно вставить прямо в текст.");
-                player.Reply("[Overpanel] Или просто /report — список ваших обращений.");
                 return;
             }
 
-            var targetId = ResolveTarget(args[0]);
-            var text     = string.Join(" ", args, 1, args.Length - 1);
-
-            SubmitReport(basePlayer, targetId, text);
-        }
-
-        private string ResolveTarget(string query)
-        {
-            if (query.Length == 17 && query.All(char.IsDigit))
-                return query;
-
-            var found = BasePlayer.activePlayerList
-                .FirstOrDefault(p => p.displayName.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0);
-
-            return found?.UserIDString ?? query;
+            SubmitReport(basePlayer, null, text);
         }
 
         private void SubmitReport(BasePlayer author, string targetId, string text)
@@ -3059,7 +3070,9 @@ namespace Oxide.Plugins
                 ["attachments"]    = attachments,
             });
 
-            SyncReportToIQReport(author.UserIDString, targetId, text);
+            // У свободного текста нет конкретной цели — IQReport требует её, пропускаем
+            if (!string.IsNullOrEmpty(targetId))
+                SyncReportToIQReport(author.UserIDString, targetId, text);
 
             SendReply(author, "[Overpanel] Обращение отправлено. Ожидайте ответа администрации.");
 
@@ -3608,6 +3621,31 @@ namespace Oxide.Plugins
         private string GetAdminTitle(string steamId, string fallback)
         {
             return _adminsCache.TryGetValue(steamId, out var admin) ? admin.Title : fallback;
+        }
+
+        /// <summary>
+        /// Подпись админа для объявлений в чате: "Ник (Должность)".
+        /// Панель присылает только admin_title, поэтому в чате раньше было
+        /// "заблокирован администратором Руководитель" — как будто это ник.
+        /// Ник берём из _adminsCache; если его там нет — остаётся одна должность.
+        /// </summary>
+        private string GetAdminLabel(string steamId, string adminTitle)
+        {
+            string name = null;
+            if (!string.IsNullOrEmpty(steamId) && _adminsCache.TryGetValue(steamId, out var admin))
+            {
+                name = admin.Name;
+                if (string.IsNullOrEmpty(adminTitle)) adminTitle = admin.Title;
+            }
+
+            if (string.IsNullOrEmpty(name))
+            {
+                var online = string.IsNullOrEmpty(steamId) ? null : BasePlayer.Find(steamId);
+                if (online != null) name = online.displayName;
+            }
+
+            if (string.IsNullOrEmpty(name)) return string.IsNullOrEmpty(adminTitle) ? "—" : adminTitle;
+            return string.IsNullOrEmpty(adminTitle) ? name : $"{name} ({adminTitle})";
         }
 
         // ── Админ-чат ────────────────────────────────────────────────
