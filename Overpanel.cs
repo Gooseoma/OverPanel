@@ -162,7 +162,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.6";
+        internal const string PLUGIN_VERSION = "1.0.7";
 
         internal PluginConfig _config;
 
@@ -916,12 +916,15 @@ namespace Oxide.Plugins
             // Игроки, которые были в онлайне до реконнекта
             foreach (var player in BasePlayer.activePlayerList)
             {
+                bool isAdmin = _adminsCache.ContainsKey(player.UserIDString);
                 SendEvent("player.connected", new Dictionary<string, object>
                 {
-                    ["steamid"] = player.UserIDString,
-                    ["name"]    = player.displayName,
-                    ["ip"]      = GetPlayerIp(player),
-                    ["team_id"] = player.currentTeam,
+                    ["steamid"]     = player.UserIDString,
+                    ["name"]        = player.displayName,
+                    ["ip"]          = GetPlayerIp(player),
+                    ["team_id"]     = player.currentTeam,
+                    ["is_admin"]    = isAdmin,
+                    ["admin_title"] = isAdmin ? GetAdminTitle(player.UserIDString, null) : null,
                 });
             }
         }
@@ -3541,13 +3544,16 @@ namespace Oxide.Plugins
         {
             var ip = GetPlayerIp(player);
             var isPirate = IsPlayerPirate(player);
+            bool isAdmin = _adminsCache.ContainsKey(player.UserIDString);
 
             SendEvent("player.connected", new Dictionary<string, object>
             {
-                ["steamid"] = player.UserIDString,
-                ["name"]    = player.displayName,
-                ["ip"]      = ip,
-                ["team_id"] = player.currentTeam,
+                ["steamid"]     = player.UserIDString,
+                ["name"]        = player.displayName,
+                ["ip"]          = ip,
+                ["team_id"]     = player.currentTeam,
+                ["is_admin"]    = isAdmin,
+                ["admin_title"] = isAdmin ? GetAdminTitle(player.UserIDString, null) : null,
             });
 
             if (isPirate)
