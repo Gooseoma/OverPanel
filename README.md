@@ -7,11 +7,11 @@
 Мультипроектность · Гибкая система ролей · Инструменты профессиональной модерации
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-active%20development-yellow)
+![Status](https://img.shields.io/badge/status-released-green)
 ![Carbon](https://img.shields.io/badge/Carbon-supported-blue)
 ![Oxide/uMod](https://img.shields.io/badge/Oxide%2FuMod-supported-blue)
 
-[Возможности](#-основные-возможности) · [SaaS-модель](#-saas-модель) · [Платформы](#-поддерживаемые-платформы) · [Лицензия](#-лицензия)
+[Возможности](#-основные-возможности) · [SaaS-модель](#-saas-модель) · [Платформы](#-поддерживаемые-платформы) · [Лицензия](#-лицензия)  · [Сайт](https://overpanel.ru)
 
 </div>
 
