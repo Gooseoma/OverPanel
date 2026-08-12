@@ -162,7 +162,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.8";
+        internal const string PLUGIN_VERSION = "1.0.9";
 
         internal PluginConfig _config;
 
@@ -1507,6 +1507,22 @@ namespace Oxide.Plugins
                 ["channel"] = channelName,
             });
 
+            // Красим ник админа в общем чате — раньше плагин знал, кто админ
+            // (_adminsCache), но нигде это не использовал для самого чата в игре,
+            // только для служебных объявлений о банах/мутах. Team/Clan не трогаем:
+            // Server.Broadcast ушёл бы всем, а не только команде/клану.
+            if (channelName == "Global" && _adminsCache.TryGetValue(player.UserIDString, out var chatAdmin))
+            {
+                // Ник берём у самого игрока (его реальный текущий displayName),
+                // а не из AdminData.Name — тот может отставать от игрового ника,
+                // это снимок с момента последней синхронизации ролей с панели.
+                var label = string.IsNullOrEmpty(chatAdmin.Title)
+                    ? player.displayName
+                    : $"{player.displayName} ({chatAdmin.Title})";
+                Server.Broadcast($"<color=#66ff66>{label}</color>: {message}");
+                return false;
+            }
+
             return null;
         }
 
@@ -2354,14 +2370,38 @@ namespace Oxide.Plugins
         }
 
         /// <summary>Общая шапка: заголовок, «Правила», крестик.</summary>
+        // Facepunch Rust.Community Icons.cs: Shield = 61746 — кодпоинт в кастомном
+        // иконочном шрифте, а не спрайт/итем-айди. Шрифт для рендера этого диапазона
+        // подтвердить не удалось (Icons.cs — из внутренних тулов Facepunch, не факт,
+        // что тот же шрифт стоит у обычных игроков) — ПРОВЕРИТЬ на реальном клиенте
+        // первым делом; если иконка не отрисуется, скорее всего дело в Font ниже.
+        private const int ICON_SHIELD = 61746;
+
         private void AddReportHeader(CuiElementContainer elements, string parent)
         {
-            // Акцентный квадрат перед заголовком убран — читался как случайный
-            // логотип и только съедал место, текст теперь начинается от края.
+            // Акцентный квадрат-логотип убран, вместо него — иконка щита из
+            // кастомного шрифта (см. ICON_SHIELD выше)
+            elements.Add(new CuiElement
+            {
+                Parent = parent,
+                Components =
+                {
+                    new CuiTextComponent
+                    {
+                        Text = char.ConvertFromUtf32(ICON_SHIELD),
+                        Font = "RobotoCondensed-Bold.ttf",
+                        FontSize = 22,
+                        Align = TextAnchor.MiddleCenter,
+                        Color = COL_ACCENT,
+                    },
+                    new CuiRectTransformComponent { AnchorMin = "0.03 0.928", AnchorMax = "0.065 0.978" },
+                },
+            });
+
             elements.Add(new CuiLabel
             {
                 Text = { Text = "Система репортов", FontSize = 20, Align = TextAnchor.LowerLeft, Color = COL_TEXT },
-                RectTransform = { AnchorMin = "0.03 0.938", AnchorMax = "0.6 0.982" }
+                RectTransform = { AnchorMin = "0.075 0.938", AnchorMax = "0.6 0.982" }
             }, parent);
 
             elements.Add(new CuiLabel
@@ -3018,6 +3058,17 @@ namespace Oxide.Plugins
             var basePlayer = player.Object as BasePlayer;
             if (basePlayer == null) return;
 
+            // Улучшенные репорты выключены на этом сервере — система обращений
+            // Overpanel для игроков не работает вовсе, /report только отправляет
+            // на встроенный отчёт Rust (F7). Раньше здесь всё равно принимался
+            // текст и создавалось обращение в панели — это было расхождение
+            // с настройкой сервера, теперь /report ничего не создаёт.
+            if (!_improvedReports)
+            {
+                player.Reply("[Overpanel] Репорт доступен через F7");
+                return;
+            }
+
             // Весь текст после /report — это описание проблемы целиком.
             // Раньше первое слово молча съедалось как <цель> и требовалось минимум
             // 2 аргумента, поэтому "/report тут читер" уходил целью "тут", а
@@ -3027,17 +3078,7 @@ namespace Oxide.Plugins
 
             if (string.IsNullOrEmpty(text))
             {
-                // Без текста: с улучшенными репортами открываем CUI, без них —
-                // подсказываем чат-синтаксис, чтобы экран вообще не появлялся.
-                if (_improvedReports)
-                {
-                    RequestReportList(basePlayer);
-                    return;
-                }
-
-                player.Reply("[Overpanel] Использование: /report <текст обращения>");
-                player.Reply("[Overpanel] Например: /report тут читер");
-                player.Reply("[Overpanel] Ссылку на доказательства можно вставить прямо в текст.");
+                RequestReportList(basePlayer);
                 return;
             }
 
@@ -3663,8 +3704,11 @@ namespace Oxide.Plugins
                 return;
             }
 
-            var title = GetAdminTitle(player.UserIDString, player.displayName);
-            var adminMsg = $"<color=#5599FF>[ADMIN]</color> <color=#66ff66>{title}</color>: {msg}";
+            // Раньше в подписи была голая роль без ника (GetAdminTitle игнорирует
+            // fallback, если игрок уже есть в _adminsCache) — GetAdminLabel всегда
+            // собирает "Ник (Должность)".
+            var label = GetAdminLabel(player.UserIDString, null);
+            var adminMsg = $"<color=#5599FF>[ADMIN]</color> <color=#66ff66>{label}</color>: {msg}";
 
             foreach (var steamId in _adminsCache.Keys)
             {
@@ -3676,7 +3720,9 @@ namespace Oxide.Plugins
             SendEvent("player.chat", new Dictionary<string, object>
             {
                 ["steamid"] = player.UserIDString,
-                ["name"]    = title,
+                // Ник игрока, а не роль — панель сама подставляет "(Должность)"
+                // по Player.isAdmin/adminTitle из БД, дублировать не нужно
+                ["name"]    = player.displayName,
                 ["message"] = msg,
                 ["channel"] = "Admin",
             });
@@ -3755,16 +3801,22 @@ namespace Oxide.Plugins
             var targetId = msg["target_steamid"]?.ToString();
             var message  = msg["message"]?.ToString();
             var senderTitle = msg["admin_title"]?.ToString();
+            var senderSteamId = msg["admin_steamid"]?.ToString();
             var notificationType = msg["notification_type"]?.ToString();
             var reportId = msg["report_id"]?.ToString();
 
             if (string.IsNullOrEmpty(message)) return;
 
+            // Раньше показывали только роль без ника ("[Руководитель] текст") —
+            // GetAdminLabel добавляет "Ник (Должность)", когда ник известен
+            // (по _adminsCache или по тому, что отправитель сейчас онлайн).
+            var senderLabel = GetAdminLabel(senderSteamId, senderTitle);
+
             if (string.IsNullOrEmpty(targetId))
             {
-                var broadcastText = string.IsNullOrEmpty(senderTitle)
+                var broadcastText = string.IsNullOrEmpty(senderLabel) || senderLabel == "—"
                     ? $"[Overpanel] {message}"
-                    : $"<color=#5599FF>[{senderTitle}]</color> {message}";
+                    : $"<color=#5599FF>[{senderLabel}]</color> {message}";
                 Server.Broadcast(broadcastText);
                 return;
             }
@@ -3774,15 +3826,15 @@ namespace Oxide.Plugins
 
             if (notificationType == "report.admin_message" && !string.IsNullOrEmpty(reportId))
             {
-                var adminTitle = string.IsNullOrEmpty(senderTitle) ? "Администратор" : senderTitle;
-                SendReply(player, $"<color=#5599FF>[Обращение {reportId}]</color> <color=#66ff66>{adminTitle}</color>: {message}");
+                var adminLabel = senderLabel == "—" ? "Администратор" : senderLabel;
+                SendReply(player, $"<color=#5599FF>[Обращение {reportId}]</color> <color=#66ff66>{adminLabel}</color>: {message}");
                 HandleIncomingReportReply(player, reportId, message);
                 return;
             }
 
-            var text = string.IsNullOrEmpty(senderTitle)
+            var text = senderLabel == "—"
                 ? $"[Overpanel] {message}"
-                : $"<color=#5599FF>[{senderTitle}]</color> {message}";
+                : $"<color=#5599FF>[{senderLabel}]</color> {message}";
             SendReply(player, text);
         }
 
