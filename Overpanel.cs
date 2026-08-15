@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.1.3")]
+    [Info("Overpanel", "Gooseoma", "1.1.4")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -165,7 +165,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.1.3";
+        internal const string PLUGIN_VERSION = "1.1.4";
 
         internal PluginConfig _config;
 
@@ -893,6 +893,7 @@ namespace Oxide.Plugins
                 case "accesslist.update": HandleActionAccessListUpdate(msg); break;
                 case "config.update":     HandleActionConfigUpdate(msg);     break;
                 case "roles.update":      HandleActionRolesUpdate(msg);      break;
+                case "rules.update":      HandleActionRulesUpdate(msg);      break;
 
                 case "report.message":       HandleActionReportMessage(msg); break;
                 case "report.close":         HandleActionReportClose(msg);   break;
@@ -2252,39 +2253,111 @@ namespace Oxide.Plugins
 
         private Dictionary<ulong, string> _playerRulesCache = new Dictionary<ulong, string>();
 
-        internal void ShowRulesScreen(BasePlayer player, string rulesText)
+        /// <summary>Меню выбора: правила сервера или правила подачи репортов. Синяя тема — как у /report.</summary>
+        internal void ShowRulesScreen(BasePlayer player)
         {
             CuiHelper.DestroyUi(player, RULES_PANEL_UI);
 
             var elements = new CuiElementContainer();
             var panel = elements.Add(new CuiPanel
             {
-                Image = { Color = "0.06 0.06 0.06 0.97" },
+                Image = { Color = COL_BG },
+                RectTransform = { AnchorMin = "0.3 0.25", AnchorMax = "0.7 0.75" },
+                CursorEnabled = true
+            }, "Overlay", RULES_PANEL_UI);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Правила", FontSize = 18, Align = TextAnchor.MiddleCenter, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0 0.85", AnchorMax = "1 1" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.rules.server", Color = COL_ACCENT },
+                RectTransform = { AnchorMin = "0.1 0.53", AnchorMax = "0.9 0.75" },
+                Text = { Text = "Правила сервера", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.rules.report", Color = COL_ACCENT },
+                RectTransform = { AnchorMin = "0.1 0.28", AnchorMax = "0.9 0.5" },
+                Text = { Text = "Правила подачи репортов", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.closerules", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.35 0.06", AnchorMax = "0.65 0.2" },
+                Text = { Text = "Закрыть", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = COL_MUTED }
+            }, panel);
+
+            CuiHelper.AddUi(player, elements);
+        }
+
+        /// <summary>Текст конкретной категории правил — тоже в синей теме, с кнопкой назад в меню.</summary>
+        private void ShowRulesDetailScreen(BasePlayer player, string title, string text)
+        {
+            CuiHelper.DestroyUi(player, RULES_PANEL_UI);
+
+            var elements = new CuiElementContainer();
+            var panel = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_BG },
                 RectTransform = { AnchorMin = "0.2 0.1", AnchorMax = "0.8 0.9" },
                 CursorEnabled = true
             }, "Overlay", RULES_PANEL_UI);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = "ПРАВИЛА СЕРВЕРА", FontSize = 18, Align = TextAnchor.UpperCenter, Color = "0.6 1 0.6 1" },
-                RectTransform = { AnchorMin = "0 0.92", AnchorMax = "1 1" }
+                Text = { Text = title, FontSize = 18, Align = TextAnchor.UpperCenter, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0 0.9", AnchorMax = "1 1" }
             }, panel);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = string.IsNullOrEmpty(rulesText) ? "Правила не установлены." : rulesText,
-                         FontSize = 12, Align = TextAnchor.UpperLeft, Color = "0.9 0.9 0.9 1" },
-                RectTransform = { AnchorMin = "0.03 0.05", AnchorMax = "0.97 0.9" }
+                Text = { Text = string.IsNullOrEmpty(text) ? "Правила не установлены." : text,
+                         FontSize = 12, Align = TextAnchor.UpperLeft, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.03 0.12", AnchorMax = "0.97 0.88" }
             }, panel);
 
             elements.Add(new CuiButton
             {
-                Button = { Command = "overpanel.closerules", Color = "0.3 0.3 0.3 1" },
-                RectTransform = { AnchorMin = "0.4 0.01", AnchorMax = "0.6 0.05" },
-                Text = { Text = "Закрыть", FontSize = 12, Align = TextAnchor.MiddleCenter }
+                Button = { Command = "overpanel.rules.menu", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.35 0.02", AnchorMax = "0.5 0.09" },
+                Text = { Text = "< Назад", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = COL_TEXT }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.closerules", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.5 0.02", AnchorMax = "0.65 0.09" },
+                Text = { Text = "Закрыть", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = COL_MUTED }
             }, panel);
 
             CuiHelper.AddUi(player, elements);
+        }
+
+        [ConsoleCommand("overpanel.rules.menu")]
+        private void CmdRulesMenu(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowRulesScreen(player);
+        }
+
+        [ConsoleCommand("overpanel.rules.server")]
+        private void CmdRulesServer(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowRulesDetailScreen(player, "Правила сервера", GetServerRules());
+        }
+
+        [ConsoleCommand("overpanel.rules.report")]
+        private void CmdRulesReport(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowRulesDetailScreen(player, "Правила подачи репортов", GetReportRules());
         }
 
         [ConsoleCommand("overpanel.closerules")]
@@ -2961,7 +3034,7 @@ namespace Oxide.Plugins
             if (player == null) return;
             CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
             CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
-            ShowRulesScreen(player, GetServerRules());
+            ShowRulesScreen(player);
         }
 
         [ConsoleCommand("overpanel.report.attach")]
@@ -3354,7 +3427,7 @@ namespace Oxide.Plugins
             var basePlayer = player.Object as BasePlayer;
             if (basePlayer == null) return;
 
-            ShowRulesScreen(basePlayer, GetServerRules());
+            ShowRulesScreen(basePlayer);
         }
 
         private void CmdPanel(IPlayer player, string command, string[] args)
@@ -3364,28 +3437,48 @@ namespace Oxide.Plugins
         }
 
         // ── Правила сервера ──────────────────────────────────────────
+        // Два независимых текста (ServerRules.rulesText / reportRulesText в БД
+        // панели) — приходят из панели через WS-экшен rules.update, хранятся
+        // локально на случай переподключения/перезагрузки плагина.
 
         private string GetServerRules()
         {
+            return ReadRulesFile().TryGetValue("rules", out var text) ? text : "";
+        }
+
+        private string GetReportRules()
+        {
+            return ReadRulesFile().TryGetValue("report_rules", out var text) ? text : "";
+        }
+
+        private Dictionary<string, string> ReadRulesFile()
+        {
             try
             {
-                var rules = Interface.Oxide.DataFileSystem
-                    .ReadObject<Dictionary<string, string>>("Overpanel/ServerRules");
-
-                return rules != null && rules.TryGetValue("text", out var text) ? text : "";
+                return Interface.Oxide.DataFileSystem
+                    .ReadObject<Dictionary<string, string>>("Overpanel/ServerRules")
+                    ?? new Dictionary<string, string>();
             }
             catch
             {
-                return "";
+                return new Dictionary<string, string>();
             }
         }
 
-        internal void UpdateServerRules(string text)
+        internal void UpdateServerRules(string rulesText, string reportRulesText)
         {
             Interface.Oxide.DataFileSystem.WriteObject("Overpanel/ServerRules",
-                new Dictionary<string, string> { ["text"] = text });
+                new Dictionary<string, string> { ["rules"] = rulesText, ["report_rules"] = reportRulesText });
 
             Puts("[Overpanel] Правила сервера обновлены.");
+        }
+
+        /// <summary>Пришло из панели: rules.update — синхронизация текстов правил.</summary>
+        private void HandleActionRulesUpdate(JObject msg)
+        {
+            var rulesText = msg["rules_text"]?.ToString() ?? "";
+            var reportRulesText = msg["report_rules_text"]?.ToString() ?? "";
+            UpdateServerRules(rulesText, reportRulesText);
         }
 
         // ── Фидбек ───────────────────────────────────────────────────
