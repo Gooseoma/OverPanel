@@ -29,7 +29,7 @@ namespace Oxide.Plugins
     ///   Plugin Core & Lifecycle, Configuration, Data & Storage,
     ///   Connection & Pairing, WebSocket, Permissions & Admins, Access List,
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
-    ///   RCON, Player Hooks & Chat, Integrations.
+    ///   RCON, Player Hooks & Chat, Integrations.1
     /// </summary>
     [Info("Overpanel", "Gooseoma", "1.1.4")]
     [Description("Administrative panel integration for Rust servers")]
