@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.0.5")]
+    [Info("Overpanel", "Gooseoma", "1.1.0")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -50,10 +50,13 @@ namespace Oxide.Plugins
         {
             _isCarbon = IsCarbon();
 
+            // Папки в data/Overpanel/ (в т.ч. audio/) должны существовать ДО проверки
+            // аудиофайлов — иначе на свежем сервере ValidateAudioFiles() всегда падает
+            // с "Audio files missing" и выгружает плагин, даже не успев их создать.
+            CreateDirectoryStructure();
+
             if (!ValidateAudioFiles()) return;
 
-            CreateDirectoryStructure();
-            LoadLocalReportBackground();
             LoadConfig();
             InitPermissionsCache();
             InitWebSocket();
@@ -162,7 +165,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.9";
+        internal const string PLUGIN_VERSION = "1.1.0";
 
         internal PluginConfig _config;
 
@@ -2340,10 +2343,7 @@ namespace Oxide.Plugins
             return first.Length > 42 ? first.Substring(0, 42) + "…" : first;
         }
 
-        /// <summary>
-        /// Корневая панель. Если в data/Overpanel/images/REPORT_SCREEN.png лежит
-        /// картинка (1202×805), она рисуется фоном; иначе — сплошная заливка.
-        /// </summary>
+        /// <summary>Корневая панель /report — сплошная заливка.</summary>
         private string AddReportRoot(CuiElementContainer elements, string uiName)
         {
             var panel = elements.Add(new CuiPanel
@@ -2353,55 +2353,16 @@ namespace Oxide.Plugins
                 CursorEnabled = true
             }, "Overlay", uiName);
 
-            if (_reportBgCrc.HasValue)
-            {
-                elements.Add(new CuiElement
-                {
-                    Parent = panel,
-                    Components =
-                    {
-                        new CuiRawImageComponent { Png = _reportBgCrc.Value.ToString(), Color = "1 1 1 1" },
-                        new CuiRectTransformComponent { AnchorMin = "0 0", AnchorMax = "1 1" }
-                    }
-                });
-            }
-
             return panel;
         }
 
         /// <summary>Общая шапка: заголовок, «Правила», крестик.</summary>
-        // Facepunch Rust.Community Icons.cs: Shield = 61746 — кодпоинт в кастомном
-        // иконочном шрифте, а не спрайт/итем-айди. Шрифт для рендера этого диапазона
-        // подтвердить не удалось (Icons.cs — из внутренних тулов Facepunch, не факт,
-        // что тот же шрифт стоит у обычных игроков) — ПРОВЕРИТЬ на реальном клиенте
-        // первым делом; если иконка не отрисуется, скорее всего дело в Font ниже.
-        private const int ICON_SHIELD = 61746;
-
         private void AddReportHeader(CuiElementContainer elements, string parent)
         {
-            // Акцентный квадрат-логотип убран, вместо него — иконка щита из
-            // кастомного шрифта (см. ICON_SHIELD выше)
-            elements.Add(new CuiElement
-            {
-                Parent = parent,
-                Components =
-                {
-                    new CuiTextComponent
-                    {
-                        Text = char.ConvertFromUtf32(ICON_SHIELD),
-                        Font = "RobotoCondensed-Bold.ttf",
-                        FontSize = 22,
-                        Align = TextAnchor.MiddleCenter,
-                        Color = COL_ACCENT,
-                    },
-                    new CuiRectTransformComponent { AnchorMin = "0.03 0.928", AnchorMax = "0.065 0.978" },
-                },
-            });
-
             elements.Add(new CuiLabel
             {
                 Text = { Text = "Система репортов", FontSize = 20, Align = TextAnchor.LowerLeft, Color = COL_TEXT },
-                RectTransform = { AnchorMin = "0.075 0.938", AnchorMax = "0.6 0.982" }
+                RectTransform = { AnchorMin = "0.03 0.938", AnchorMax = "0.6 0.982" }
             }, parent);
 
             elements.Add(new CuiLabel
@@ -4007,37 +3968,6 @@ namespace Oxide.Plugins
             catch (Exception ex)
             {
                 PrintWarning($"[Overpanel] IQReportSystem sync failed: {ex.Message}");
-            }
-        }
-
-        // ======= Локальный фон /report =======
-
-        private uint? _reportBgCrc;
-
-        /// <summary>
-        /// Грузит data/Overpanel/images/REPORT_SCREEN.png (1202×805) через FileStorage,
-        /// без внешнего хостинга и без ImageLibrary — просто кладёте файл на сервер.
-        /// Если файла нет, экраны /report используют сплошную заливку.
-        /// </summary>
-        private void LoadLocalReportBackground()
-        {
-            var path = Path.Combine(Interface.Oxide.DataDirectory, "Overpanel", "images", "REPORT_SCREEN.png");
-            if (!File.Exists(path))
-            {
-                _reportBgCrc = null;
-                return;
-            }
-
-            try
-            {
-                var bytes = File.ReadAllBytes(path);
-                _reportBgCrc = FileStorage.server.Store(bytes, FileStorage.Type.png, CommunityEntity.ServerInstance.net.ID);
-                Puts("[Overpanel] Фон /report загружен из data/Overpanel/images/REPORT_SCREEN.png");
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"[Overpanel] Не удалось загрузить REPORT_SCREEN.png: {ex.Message}");
-                _reportBgCrc = null;
             }
         }
 
