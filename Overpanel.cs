@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.1.1")]
+    [Info("Overpanel", "Gooseoma", "1.1.2")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -165,7 +165,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.1.1";
+        internal const string PLUGIN_VERSION = "1.1.2";
 
         internal PluginConfig _config;
 
@@ -1513,7 +1513,7 @@ namespace Oxide.Plugins
             // Красим ник админа в общем чате — раньше плагин знал, кто админ
             // (_adminsCache), но нигде это не использовал для самого чата в игре,
             // только для служебных объявлений о банах/мутах. Team/Clan не трогаем:
-            // Server.Broadcast ушёл бы всем, а не только команде/клану.
+            // рассылка ушла бы всем, а не только команде/клану.
             if (channelName == "Global" && _adminsCache.TryGetValue(player.UserIDString, out var chatAdmin))
             {
                 // Ник берём у самого игрока (его реальный текущий displayName),
@@ -1522,11 +1522,22 @@ namespace Oxide.Plugins
                 var label = string.IsNullOrEmpty(chatAdmin.Title)
                     ? player.displayName
                     : $"{player.displayName} ({chatAdmin.Title})";
-                Server.Broadcast($"<color=#66ff66>{label}</color>: {message}");
+                // Вместо Server.Broadcast (аватар сервера/пусто) шлём chat.add вручную
+                // каждому клиенту с SteamID самого админа вторым аргументом — движок
+                // Rust сам подтянет его реальную Steam-аватарку (так делают IQChat
+                // и другие плагины через свою команду /rename).
+                BroadcastChatWithAvatar(channel, player.UserIDString, $"<color=#66ff66>{label}</color>: {message}");
                 return false;
             }
 
             return null;
+        }
+
+        /// <summary>Рассылает сообщение всем игрокам с аватаркой конкретного SteamID вместо серверной.</summary>
+        private static void BroadcastChatWithAvatar(ConVar.Chat.ChatChannel channel, string avatarSteamId, string message)
+        {
+            foreach (var p in BasePlayer.activePlayerList)
+                p.SendConsoleCommand("chat.add", channel, avatarSteamId, message);
         }
 
         // ── WS-обработчики (панель → наказание) ──────────────────────
