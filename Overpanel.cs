@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.1.0")]
+    [Info("Overpanel", "Gooseoma", "1.1.1")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -165,7 +165,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.1.0";
+        internal const string PLUGIN_VERSION = "1.1.1";
 
         internal PluginConfig _config;
 
@@ -2764,6 +2764,77 @@ namespace Oxide.Plugins
             CuiHelper.AddUi(player, elements);
         }
 
+        /// <summary>Экран описания проблемы — открывается после выбора категории.</summary>
+        private void ShowReportDescribeScreen(BasePlayer player, string category)
+        {
+            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+
+            var elements = new CuiElementContainer();
+            var root = AddReportRoot(elements, REPORT_DETAIL_PANEL_UI);
+            AddReportHeader(elements, root);
+
+            var pane = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_CARD },
+                RectTransform = { AnchorMin = "0.018 0.02", AnchorMax = "0.982 0.885" }
+            }, root);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = $"Категория: {category}", FontSize = 15, Align = TextAnchor.MiddleLeft, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.03 0.9", AnchorMax = "0.7 0.97" }
+            }, pane);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.category.back", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.8 0.9", AnchorMax = "0.97 0.965" },
+                Text = { Text = "< Назад", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = COL_TEXT }
+            }, pane);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Опишите ситуацию кратко:", FontSize = 12, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                RectTransform = { AnchorMin = "0.03 0.78", AnchorMax = "0.7 0.83" }
+            }, pane);
+
+            var inputBg = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.03 0.55", AnchorMax = "0.97 0.77" }
+            }, pane);
+
+            elements.Add(new CuiElement
+            {
+                Parent = inputBg,
+                Components =
+                {
+                    new CuiInputFieldComponent
+                    {
+                        Command = "overpanel.report.describe.submit",
+                        FontSize = 12,
+                        Color = COL_TEXT,
+                        CharsLimit = 400,
+                        NeedsKeyboard = true,
+                        Align = TextAnchor.UpperLeft,
+                        Text = "",
+                    },
+                    new CuiRectTransformComponent { AnchorMin = "0.02 0.06", AnchorMax = "0.98 0.94" }
+                }
+            });
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Доказательства: загрузите видео на Яндекс.Диск или Dropbox и вставьте ссылку прямо в текст.\n"
+                              + "Enter — отправить обращение.",
+                         FontSize = 11, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                RectTransform = { AnchorMin = "0.03 0.4", AnchorMax = "0.97 0.53" }
+            }, pane);
+
+            CuiHelper.AddUi(player, elements);
+        }
+
         /// <summary>Подсказка по вложениям (загрузить файл из игры нельзя).</summary>
         private void ShowReportAttachHelp(BasePlayer player)
         {
@@ -2836,13 +2907,35 @@ namespace Oxide.Plugins
             if (index < 0 || index >= ReportCategories.Length) return;
 
             _pendingReportCategory[player.userID] = ReportCategories[index];
+            ShowReportDescribeScreen(player, ReportCategories[index]);
+        }
+
+        [ConsoleCommand("overpanel.report.category.back")]
+        private void CmdReportCategoryBack(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            _pendingReportCategory.Remove(player.userID);
+            ShowReportCreateScreen(player);
+        }
+
+        [ConsoleCommand("overpanel.report.describe.submit")]
+        private void CmdReportDescribeSubmit(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+
+            var words = new List<string>();
+            if (arg.Args != null)
+                for (var i = 0; i < arg.Args.Length; i++) words.Add(arg.GetString(i));
+            var text = string.Join(" ", words).Trim();
+
+            if (string.IsNullOrEmpty(text)) return;
 
             CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
             CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
 
-            SendReply(player,
-                $"<color=#5599FF>[Overpanel]</color> Категория: {ReportCategories[index]}.\n" +
-                "Опишите проблему командой: /report <текст>. Ссылку на доказательства можно вставить прямо в текст.");
+            SubmitReport(player, null, text);
         }
 
         [ConsoleCommand("overpanel.report.rules")]
