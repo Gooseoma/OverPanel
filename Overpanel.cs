@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.1.2")]
+    [Info("Overpanel", "Gooseoma", "1.1.3")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -165,7 +165,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.1.2";
+        internal const string PLUGIN_VERSION = "1.1.3";
 
         internal PluginConfig _config;
 
@@ -1288,16 +1288,16 @@ namespace Oxide.Plugins
         }
 
         /// <summary>Бан по команде из панели — администратор может быть не в игре.</summary>
-        internal void ApplyBanRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason, int duration)
+        internal void ApplyBanRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason, int duration, bool showAvatar = false)
         {
             var target = BasePlayer.Find(targetSteamId);
             var targetName = target?.displayName ?? targetSteamId;
 
-            ExecuteBan(targetSteamId, targetName, adminSteamId, adminTitle, reason, duration);
+            ExecuteBan(targetSteamId, targetName, adminSteamId, adminTitle, reason, duration, showAvatar);
         }
 
         private void ExecuteBan(string targetSteamId, string targetName, string adminSteamId,
-                                string adminTitle, string reason, int duration)
+                                string adminTitle, string reason, int duration, bool showAvatar = false)
         {
             if (_isCarbon)
                 Server.Command($"ban {targetSteamId} \"{reason}\" {duration}");
@@ -1313,7 +1313,8 @@ namespace Oxide.Plugins
 
             ChatAlert($"<color=#FF4444>БАН:</color> {targetName} заблокирован администратором " +
                       $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
-                      (duration > 0 ? $" ({FormatDuration(duration)})" : " (навсегда)"));
+                      (duration > 0 ? $" ({FormatDuration(duration)})" : " (навсегда)"),
+                      showAvatar ? adminSteamId : null);
 
             SendEvent("punishment.issued", new Dictionary<string, object>
             {
@@ -1342,17 +1343,17 @@ namespace Oxide.Plugins
                         reason, durationSeconds, channels);
         }
 
-        internal void ApplyMuteRemote(string targetSteamId, string adminTitle, string reason,
-                                      int durationSeconds, HashSet<string> channels)
+        internal void ApplyMuteRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason,
+                                      int durationSeconds, HashSet<string> channels, bool showAvatar = false)
         {
             var target = BasePlayer.Find(targetSteamId);
             var targetName = target?.displayName ?? targetSteamId;
 
-            ExecuteMute(targetSteamId, targetName, null, adminTitle, reason, durationSeconds, channels);
+            ExecuteMute(targetSteamId, targetName, adminSteamId, adminTitle, reason, durationSeconds, channels, showAvatar);
         }
 
         private void ExecuteMute(string targetSteamId, string targetName, string adminSteamId,
-                                 string adminTitle, string reason, int durationSeconds, HashSet<string> channels)
+                                 string adminTitle, string reason, int durationSeconds, HashSet<string> channels, bool showAvatar = false)
         {
             if (!ulong.TryParse(targetSteamId, out var uid)) return;
 
@@ -1380,7 +1381,8 @@ namespace Oxide.Plugins
 
             ChatAlert($"<color=#FFAA00>МУТ:</color> {targetName} замучен администратором " +
                       $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
-                      (durationSeconds > 0 ? $" ({FormatDuration(durationSeconds)})" : " (навсегда)"));
+                      (durationSeconds > 0 ? $" ({FormatDuration(durationSeconds)})" : " (навсегда)"),
+                      showAvatar ? adminSteamId : null);
 
             SendEvent("punishment.issued", new Dictionary<string, object>
             {
@@ -1549,24 +1551,27 @@ namespace Oxide.Plugins
             var adminTitle = msg["admin_title"]?.ToString() ?? "Администратор";
             var reason     = msg["reason"]?.ToString() ?? "Не указана";
             var duration   = msg["duration"]?.ToObject<int>() ?? 0;
+            var showAvatar = msg["show_avatar"]?.ToObject<bool>() ?? false;
 
             if (string.IsNullOrEmpty(targetId)) return;
 
-            ApplyBanRemote(targetId, adminId, adminTitle, reason, duration);
+            ApplyBanRemote(targetId, adminId, adminTitle, reason, duration, showAvatar);
         }
 
         private void HandleActionMute(JObject msg)
         {
             var targetId   = msg["target_steamid"]?.ToString();
+            var adminId    = msg["admin_steamid"]?.ToString();
             var adminTitle = msg["admin_title"]?.ToString() ?? "Администратор";
             var reason     = msg["reason"]?.ToString() ?? "Не указана";
             var duration   = msg["duration"]?.ToObject<int>() ?? 0;
+            var showAvatar = msg["show_avatar"]?.ToObject<bool>() ?? false;
 
             var channels = msg["channels"]?.ToObject<List<string>>() ?? new List<string> { "Global" };
 
             if (string.IsNullOrEmpty(targetId)) return;
 
-            ApplyMuteRemote(targetId, adminTitle, reason, duration, new HashSet<string>(channels));
+            ApplyMuteRemote(targetId, adminId, adminTitle, reason, duration, new HashSet<string>(channels), showAvatar);
         }
 
         private void HandleActionWarn(JObject msg)
@@ -3793,9 +3798,13 @@ namespace Oxide.Plugins
             });
         }
 
-        private void ChatAlert(string message)
+        /// <summary>avatarSteamId != null — вместо серверной аватарки показать реальную Steam-аватарку этого SteamID (настройка профиля "Отображать свою аватарку в чате").</summary>
+        private void ChatAlert(string message, string avatarSteamId = null)
         {
-            Server.Broadcast(message);
+            if (!string.IsNullOrEmpty(avatarSteamId))
+                BroadcastChatWithAvatar(ConVar.Chat.ChatChannel.Global, avatarSteamId, message);
+            else
+                Server.Broadcast(message);
         }
 
         private void NotifyAdminsInGame(string message)
