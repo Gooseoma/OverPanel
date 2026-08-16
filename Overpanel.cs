@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.1.5")]
+    [Info("Overpanel", "Gooseoma", "1.2.0")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -58,6 +58,7 @@ namespace Oxide.Plugins
             if (!ValidateAudioFiles()) return;
 
             LoadConfig();
+            LoadBans();
             InitPermissionsCache();
             InitWebSocket();
             DetectFramework();
@@ -165,7 +166,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.1.5";
+        internal const string PLUGIN_VERSION = "1.2.0";
 
         internal PluginConfig _config;
 
@@ -989,34 +990,7 @@ namespace Oxide.Plugins
         internal void UpdateAdminFromWs(AdminData data)
         {
             _adminsCache[data.SteamId] = data;
-            AssignCarbonGroup(data.SteamId, data.Level);
             SaveAdminFile(data);
-        }
-
-        private void AssignCarbonGroup(string steamId, int level)
-        {
-            var player = BasePlayer.Find(steamId);
-            if (player == null) return;
-
-            // Clear existing groups
-            permission.RemoveUserGroup(steamId, "moderatorid");
-            permission.RemoveUserGroup(steamId, "ownerid");
-
-            if (_isCarbon)
-                Server.Command($"c.permgroup remove {steamId} developerid");
-
-            if (level == 0) return;
-
-            if (level >= 1 && level <= 6)
-                permission.AddUserGroup(steamId, "moderatorid");
-            else if (level >= 7 && level <= 8)
-                permission.AddUserGroup(steamId, "ownerid");
-            else if (level == 9)
-            {
-                permission.AddUserGroup(steamId, "ownerid");
-                if (_isCarbon)
-                    Server.Command($"c.permgroup add {steamId} developerid");
-            }
         }
 
         private void SaveAdminFile(AdminData data)
@@ -1274,6 +1248,64 @@ namespace Oxide.Plugins
         }
 
         // ── Бан ──────────────────────────────────────────────────────
+        //
+        // Собственное хранилище банов вместо нативного бана Facepunch (ban/banid) —
+        // с ним бывают траблы (десинхронизация со steam-ban-листом, зависимость от
+        // движка). Проверяем сами в CanClientLogin и кикаем с понятной причиной.
+
+        private Dictionary<ulong, BanData> _bannedPlayers = new Dictionary<ulong, BanData>();
+
+        internal class BanData
+        {
+            public string Reason       { get; set; }
+            public string AdminSteamId { get; set; }
+            public string AdminTitle   { get; set; }
+            public string AdminName    { get; set; }
+            public DateTime Expires    { get; set; } = DateTime.MaxValue;
+        }
+
+        private void LoadBans()
+        {
+            try
+            {
+                _bannedPlayers = Interface.Oxide.DataFileSystem
+                    .ReadObject<Dictionary<ulong, BanData>>("Overpanel/bans") ?? new Dictionary<ulong, BanData>();
+            }
+            catch
+            {
+                _bannedPlayers = new Dictionary<ulong, BanData>();
+            }
+        }
+
+        private void SaveBans()
+        {
+            Interface.Oxide.DataFileSystem.WriteObject("Overpanel/bans", _bannedPlayers);
+        }
+
+        private static string FormatUnbanDate(DateTime expires)
+        {
+            return expires == DateTime.MaxValue
+                ? "никогда (перманентный бан)"
+                : expires.ToLocalTime().ToString("dd.MM.yyyy HH:mm", CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>Блокирует подключение забаненному игроку до захода в мир — стандартный Oxide-хук.</summary>
+        object CanClientLogin(Network.Connection connection)
+        {
+            if (connection == null || !ulong.TryParse(connection.userid.ToString(), out var uid)) return null;
+            if (!_bannedPlayers.TryGetValue(uid, out var ban)) return null;
+
+            if (ban.Expires != DateTime.MaxValue && ban.Expires <= DateTime.UtcNow)
+            {
+                _bannedPlayers.Remove(uid);
+                SaveBans();
+                return null;
+            }
+
+            var title = string.IsNullOrEmpty(ban.AdminTitle) ? "Администратор" : ban.AdminTitle;
+            var name = string.IsNullOrEmpty(ban.AdminName) ? "" : $" {ban.AdminName}";
+            return $"Вы были заблокированы {title}{name} по причине {ban.Reason}. Дата разбана: {FormatUnbanDate(ban.Expires)}";
+        }
 
         /// <summary>Бан от администратора, находящегося в игре.</summary>
         private void ApplyBan(BasePlayer target, BasePlayer admin, string reason, int duration = 0)
@@ -1307,20 +1339,35 @@ namespace Oxide.Plugins
         private void ExecuteBan(string targetSteamId, string targetName, string adminSteamId,
                                 string adminTitle, string reason, int duration, bool showAvatar = false, bool isRemote = false)
         {
-            if (_isCarbon)
-                Server.Command($"ban {targetSteamId} \"{reason}\" {duration}");
-            else
-                Server.Command($"banid {targetSteamId} \"{reason}\" {duration}");
+            if (ulong.TryParse(targetSteamId, out var targetUid))
+            {
+                _bannedPlayers[targetUid] = new BanData
+                {
+                    Reason       = reason,
+                    AdminSteamId = adminSteamId,
+                    AdminTitle   = adminTitle,
+                    AdminName    = ResolveAdminName(adminSteamId),
+                    Expires      = duration > 0 ? DateTime.UtcNow.AddSeconds(duration) : DateTime.MaxValue,
+                };
+                SaveBans();
+            }
 
             var target = BasePlayer.Find(targetSteamId);
             if (target != null)
+            {
                 SyncBanToIQBanSystem(target, reason, duration);
+                var title = string.IsNullOrEmpty(adminTitle) ? "Администратор" : adminTitle;
+                var nick = ResolveAdminName(adminSteamId);
+                var nickPart = string.IsNullOrEmpty(nick) ? "" : $" {nick}";
+                target.Kick($"Вы были заблокированы {title}{nickPart} по причине {reason}. " +
+                            $"Дата разбана: {FormatUnbanDate(duration > 0 ? DateTime.UtcNow.AddSeconds(duration) : DateTime.MaxValue)}");
+            }
 
             IncrementAdminStat(adminSteamId, "bans");
             IncrementRecap("bans");
 
-            ChatAlert($"<color=#FF4444>БАН:</color> {targetName} заблокирован администратором " +
-                      $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
+            ChatAlert($"<color=#FF4444>БАН:</color> {targetName} заблокирован " +
+                      $"<color=#66ff66>{GetActorPhrase(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
                       (duration > 0 ? $" ({FormatDuration(duration)})" : " (навсегда)"),
                       showAvatar ? adminSteamId : null);
 
@@ -1389,8 +1436,8 @@ namespace Oxide.Plugins
                 IncrementAdminStat(adminSteamId, "mutes");
             IncrementRecap("mutes");
 
-            ChatAlert($"<color=#FFAA00>МУТ:</color> {targetName} замучен администратором " +
-                      $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
+            ChatAlert($"<color=#FFAA00>МУТ:</color> {targetName} замучен " +
+                      $"<color=#66ff66>{GetActorPhrase(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
                       (durationSeconds > 0 ? $" ({FormatDuration(durationSeconds)})" : " (навсегда)"),
                       showAvatar ? adminSteamId : null);
 
@@ -1531,7 +1578,13 @@ namespace Oxide.Plugins
             // (_adminsCache), но нигде это не использовал для самого чата в игре,
             // только для служебных объявлений о банах/мутах. Team/Clan не трогаем:
             // рассылка ушла бы всем, а не только команде/клану.
-            if (channelName == "Global" && _adminsCache.TryGetValue(player.UserIDString, out var chatAdmin))
+            //
+            // С IQChat не трогаем вообще: его OnPlayerChat всегда сам транслирует
+            // сообщение через SeparatorChat независимо от того, что вернут другие
+            // плагины (Oxide вызывает все подписанные хуки, а не только первый) —
+            // если бы мы тоже транслировали здесь, сообщение админа ушло бы дважды.
+            if (channelName == "Global" && !HasIntegration("IQChat")
+                && _adminsCache.TryGetValue(player.UserIDString, out var chatAdmin))
             {
                 // Ник берём у самого игрока (его реальный текущий displayName),
                 // а не из AdminData.Name — тот может отставать от игрового ника,
@@ -1617,9 +1670,10 @@ namespace Oxide.Plugins
                 if (player != null)
                     SendReply(player, "[Overpanel] С вас снят мут.");
             }
-            else if (type == "ban")
+            else if (type == "ban" && ulong.TryParse(targetId, out var buid))
             {
-                Server.Command($"unban {targetId}");
+                _bannedPlayers.Remove(buid);
+                SaveBans();
             }
             else if (type == "warn" && ulong.TryParse(targetId, out var wuid))
             {
@@ -3850,21 +3904,39 @@ namespace Oxide.Plugins
         /// </summary>
         private string GetAdminLabel(string steamId, string adminTitle)
         {
-            string name = null;
-            if (!string.IsNullOrEmpty(steamId) && _adminsCache.TryGetValue(steamId, out var admin))
-            {
-                name = admin.Name;
-                if (string.IsNullOrEmpty(adminTitle)) adminTitle = admin.Title;
-            }
-
-            if (string.IsNullOrEmpty(name))
-            {
-                var online = string.IsNullOrEmpty(steamId) ? null : BasePlayer.Find(steamId);
-                if (online != null) name = online.displayName;
-            }
+            var name = ResolveAdminName(steamId);
+            if (string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(steamId)
+                && _adminsCache.TryGetValue(steamId, out var admin) && string.IsNullOrEmpty(adminTitle))
+                adminTitle = admin.Title;
 
             if (string.IsNullOrEmpty(name)) return string.IsNullOrEmpty(adminTitle) ? "—" : adminTitle;
             return string.IsNullOrEmpty(adminTitle) ? name : $"{name} ({adminTitle})";
+        }
+
+        /// <summary>Ник админа: из _adminsCache, иначе из живого BasePlayer, иначе null.</summary>
+        private string ResolveAdminName(string steamId)
+        {
+            if (string.IsNullOrEmpty(steamId)) return null;
+            if (_adminsCache.TryGetValue(steamId, out var admin) && !string.IsNullOrEmpty(admin.Name))
+                return admin.Name;
+            var online = BasePlayer.Find(steamId);
+            return online?.displayName;
+        }
+
+        /// <summary>
+        /// Фраза-подлежащее для объявлений о наказании: для оператора панели —
+        /// "оператором панели Ник", для обычного админа — "администратором Ник (Роль)".
+        /// Раньше оператор писался как "администратором gooseoma (Оператор панели)".
+        /// </summary>
+        private string GetActorPhrase(string steamId, string adminTitle)
+        {
+            if (adminTitle == "Оператор панели")
+            {
+                var name = ResolveAdminName(steamId);
+                return string.IsNullOrEmpty(name) ? "оператором панели" : $"оператором панели {name}";
+            }
+
+            return $"администратором {GetAdminLabel(steamId, adminTitle)}";
         }
 
         // ── Админ-чат ────────────────────────────────────────────────
