@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.1.4")]
+    [Info("Overpanel", "Gooseoma", "1.1.5")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -165,7 +165,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.1.4";
+        internal const string PLUGIN_VERSION = "1.1.5";
 
         internal PluginConfig _config;
 
@@ -1288,17 +1288,24 @@ namespace Oxide.Plugins
             ExecuteBan(target.UserIDString, target.displayName, admin.UserIDString, adminTitle, reason, duration);
         }
 
-        /// <summary>Бан по команде из панели — администратор может быть не в игре.</summary>
-        internal void ApplyBanRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason, int duration, bool showAvatar = false)
+        /// <summary>
+        /// Бан без живого BasePlayer-админа — используется и для команд из панели
+        /// (isRemote: true — панель уже создала свою запись до отправки команды,
+        /// повторно слать punishment.issued не нужно, иначе будет дублирующая
+        /// запись), и для автономных банов самого плагина (провал проверки, выход
+        /// во время проверки — isRemote: false по умолчанию, о них панель ещё не
+        /// знает, событие обязано уйти).
+        /// </summary>
+        internal void ApplyBanRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason, int duration, bool showAvatar = false, bool isRemote = false)
         {
             var target = BasePlayer.Find(targetSteamId);
             var targetName = target?.displayName ?? targetSteamId;
 
-            ExecuteBan(targetSteamId, targetName, adminSteamId, adminTitle, reason, duration, showAvatar);
+            ExecuteBan(targetSteamId, targetName, adminSteamId, adminTitle, reason, duration, showAvatar, isRemote);
         }
 
         private void ExecuteBan(string targetSteamId, string targetName, string adminSteamId,
-                                string adminTitle, string reason, int duration, bool showAvatar = false)
+                                string adminTitle, string reason, int duration, bool showAvatar = false, bool isRemote = false)
         {
             if (_isCarbon)
                 Server.Command($"ban {targetSteamId} \"{reason}\" {duration}");
@@ -1316,6 +1323,8 @@ namespace Oxide.Plugins
                       $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
                       (duration > 0 ? $" ({FormatDuration(duration)})" : " (навсегда)"),
                       showAvatar ? adminSteamId : null);
+
+            if (isRemote) return;
 
             SendEvent("punishment.issued", new Dictionary<string, object>
             {
@@ -1350,11 +1359,11 @@ namespace Oxide.Plugins
             var target = BasePlayer.Find(targetSteamId);
             var targetName = target?.displayName ?? targetSteamId;
 
-            ExecuteMute(targetSteamId, targetName, adminSteamId, adminTitle, reason, durationSeconds, channels, showAvatar);
+            ExecuteMute(targetSteamId, targetName, adminSteamId, adminTitle, reason, durationSeconds, channels, showAvatar, isRemote: true);
         }
 
         private void ExecuteMute(string targetSteamId, string targetName, string adminSteamId,
-                                 string adminTitle, string reason, int durationSeconds, HashSet<string> channels, bool showAvatar = false)
+                                 string adminTitle, string reason, int durationSeconds, HashSet<string> channels, bool showAvatar = false, bool isRemote = false)
         {
             if (!ulong.TryParse(targetSteamId, out var uid)) return;
 
@@ -1384,6 +1393,8 @@ namespace Oxide.Plugins
                       $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
                       (durationSeconds > 0 ? $" ({FormatDuration(durationSeconds)})" : " (навсегда)"),
                       showAvatar ? adminSteamId : null);
+
+            if (isRemote) return;
 
             SendEvent("punishment.issued", new Dictionary<string, object>
             {
@@ -1425,16 +1436,16 @@ namespace Oxide.Plugins
             ExecuteWarn(target.UserIDString, target.displayName, admin.UserIDString, adminTitle, reason);
         }
 
-        internal void ApplyWarnRemote(string targetSteamId, string adminTitle, string reason)
+        internal void ApplyWarnRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason)
         {
             var target = BasePlayer.Find(targetSteamId);
             var targetName = target?.displayName ?? targetSteamId;
 
-            ExecuteWarn(targetSteamId, targetName, null, adminTitle, reason);
+            ExecuteWarn(targetSteamId, targetName, adminSteamId, adminTitle, reason, isRemote: true);
         }
 
         private void ExecuteWarn(string targetSteamId, string targetName, string adminSteamId,
-                                 string adminTitle, string reason)
+                                 string adminTitle, string reason, bool isRemote = false)
         {
             if (!ulong.TryParse(targetSteamId, out var uid)) return;
 
@@ -1461,15 +1472,18 @@ namespace Oxide.Plugins
                 IncrementAdminStat(adminSteamId, "warns");
             IncrementRecap("warns");
 
-            SendEvent("punishment.issued", new Dictionary<string, object>
+            if (!isRemote)
             {
-                ["type"]           = "warn",
-                ["target_steamid"] = targetSteamId,
-                ["target_name"]    = targetName,
-                ["admin_steamid"]  = adminSteamId,
-                ["admin_title"]    = adminTitle,
-                ["reason"]         = reason,
-            });
+                SendEvent("punishment.issued", new Dictionary<string, object>
+                {
+                    ["type"]           = "warn",
+                    ["target_steamid"] = targetSteamId,
+                    ["target_name"]    = targetName,
+                    ["admin_steamid"]  = adminSteamId,
+                    ["admin_title"]    = adminTitle,
+                    ["reason"]         = reason,
+                });
+            }
 
             // Порог предупреждений — автоматический мут и сброс счётчика
             if (warnCount >= _config.MaxWarningsBeforeMute)
@@ -1556,7 +1570,7 @@ namespace Oxide.Plugins
 
             if (string.IsNullOrEmpty(targetId)) return;
 
-            ApplyBanRemote(targetId, adminId, adminTitle, reason, duration, showAvatar);
+            ApplyBanRemote(targetId, adminId, adminTitle, reason, duration, showAvatar, isRemote: true);
         }
 
         private void HandleActionMute(JObject msg)
@@ -1578,12 +1592,13 @@ namespace Oxide.Plugins
         private void HandleActionWarn(JObject msg)
         {
             var targetId   = msg["target_steamid"]?.ToString();
+            var adminId    = msg["admin_steamid"]?.ToString();
             var adminTitle = msg["admin_title"]?.ToString() ?? "Администратор";
             var reason     = msg["reason"]?.ToString() ?? "Не указана";
 
             if (string.IsNullOrEmpty(targetId)) return;
 
-            ApplyWarnRemote(targetId, adminTitle, reason);
+            ApplyWarnRemote(targetId, adminId, adminTitle, reason);
         }
 
         /// <summary>Снятие наказания (панель → сервер). Часть единой системы наказаний,
