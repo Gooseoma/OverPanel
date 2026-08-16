@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.0.5")]
+    [Info("Overpanel", "Gooseoma", "1.1.5")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -50,10 +50,13 @@ namespace Oxide.Plugins
         {
             _isCarbon = IsCarbon();
 
+            // Папки в data/Overpanel/ (в т.ч. audio/) должны существовать ДО проверки
+            // аудиофайлов — иначе на свежем сервере ValidateAudioFiles() всегда падает
+            // с "Audio files missing" и выгружает плагин, даже не успев их создать.
+            CreateDirectoryStructure();
+
             if (!ValidateAudioFiles()) return;
 
-            CreateDirectoryStructure();
-            LoadLocalReportBackground();
             LoadConfig();
             InitPermissionsCache();
             InitWebSocket();
@@ -162,7 +165,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.0.9";
+        internal const string PLUGIN_VERSION = "1.1.5";
 
         internal PluginConfig _config;
 
@@ -890,6 +893,7 @@ namespace Oxide.Plugins
                 case "accesslist.update": HandleActionAccessListUpdate(msg); break;
                 case "config.update":     HandleActionConfigUpdate(msg);     break;
                 case "roles.update":      HandleActionRolesUpdate(msg);      break;
+                case "rules.update":      HandleActionRulesUpdate(msg);      break;
 
                 case "report.message":       HandleActionReportMessage(msg); break;
                 case "report.close":         HandleActionReportClose(msg);   break;
@@ -1284,17 +1288,24 @@ namespace Oxide.Plugins
             ExecuteBan(target.UserIDString, target.displayName, admin.UserIDString, adminTitle, reason, duration);
         }
 
-        /// <summary>Бан по команде из панели — администратор может быть не в игре.</summary>
-        internal void ApplyBanRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason, int duration)
+        /// <summary>
+        /// Бан без живого BasePlayer-админа — используется и для команд из панели
+        /// (isRemote: true — панель уже создала свою запись до отправки команды,
+        /// повторно слать punishment.issued не нужно, иначе будет дублирующая
+        /// запись), и для автономных банов самого плагина (провал проверки, выход
+        /// во время проверки — isRemote: false по умолчанию, о них панель ещё не
+        /// знает, событие обязано уйти).
+        /// </summary>
+        internal void ApplyBanRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason, int duration, bool showAvatar = false, bool isRemote = false)
         {
             var target = BasePlayer.Find(targetSteamId);
             var targetName = target?.displayName ?? targetSteamId;
 
-            ExecuteBan(targetSteamId, targetName, adminSteamId, adminTitle, reason, duration);
+            ExecuteBan(targetSteamId, targetName, adminSteamId, adminTitle, reason, duration, showAvatar, isRemote);
         }
 
         private void ExecuteBan(string targetSteamId, string targetName, string adminSteamId,
-                                string adminTitle, string reason, int duration)
+                                string adminTitle, string reason, int duration, bool showAvatar = false, bool isRemote = false)
         {
             if (_isCarbon)
                 Server.Command($"ban {targetSteamId} \"{reason}\" {duration}");
@@ -1310,7 +1321,10 @@ namespace Oxide.Plugins
 
             ChatAlert($"<color=#FF4444>БАН:</color> {targetName} заблокирован администратором " +
                       $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
-                      (duration > 0 ? $" ({FormatDuration(duration)})" : " (навсегда)"));
+                      (duration > 0 ? $" ({FormatDuration(duration)})" : " (навсегда)"),
+                      showAvatar ? adminSteamId : null);
+
+            if (isRemote) return;
 
             SendEvent("punishment.issued", new Dictionary<string, object>
             {
@@ -1339,17 +1353,17 @@ namespace Oxide.Plugins
                         reason, durationSeconds, channels);
         }
 
-        internal void ApplyMuteRemote(string targetSteamId, string adminTitle, string reason,
-                                      int durationSeconds, HashSet<string> channels)
+        internal void ApplyMuteRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason,
+                                      int durationSeconds, HashSet<string> channels, bool showAvatar = false)
         {
             var target = BasePlayer.Find(targetSteamId);
             var targetName = target?.displayName ?? targetSteamId;
 
-            ExecuteMute(targetSteamId, targetName, null, adminTitle, reason, durationSeconds, channels);
+            ExecuteMute(targetSteamId, targetName, adminSteamId, adminTitle, reason, durationSeconds, channels, showAvatar, isRemote: true);
         }
 
         private void ExecuteMute(string targetSteamId, string targetName, string adminSteamId,
-                                 string adminTitle, string reason, int durationSeconds, HashSet<string> channels)
+                                 string adminTitle, string reason, int durationSeconds, HashSet<string> channels, bool showAvatar = false, bool isRemote = false)
         {
             if (!ulong.TryParse(targetSteamId, out var uid)) return;
 
@@ -1377,7 +1391,10 @@ namespace Oxide.Plugins
 
             ChatAlert($"<color=#FFAA00>МУТ:</color> {targetName} замучен администратором " +
                       $"<color=#66ff66>{GetAdminLabel(adminSteamId, adminTitle)}</color>. Причина: {reason}" +
-                      (durationSeconds > 0 ? $" ({FormatDuration(durationSeconds)})" : " (навсегда)"));
+                      (durationSeconds > 0 ? $" ({FormatDuration(durationSeconds)})" : " (навсегда)"),
+                      showAvatar ? adminSteamId : null);
+
+            if (isRemote) return;
 
             SendEvent("punishment.issued", new Dictionary<string, object>
             {
@@ -1419,16 +1436,16 @@ namespace Oxide.Plugins
             ExecuteWarn(target.UserIDString, target.displayName, admin.UserIDString, adminTitle, reason);
         }
 
-        internal void ApplyWarnRemote(string targetSteamId, string adminTitle, string reason)
+        internal void ApplyWarnRemote(string targetSteamId, string adminSteamId, string adminTitle, string reason)
         {
             var target = BasePlayer.Find(targetSteamId);
             var targetName = target?.displayName ?? targetSteamId;
 
-            ExecuteWarn(targetSteamId, targetName, null, adminTitle, reason);
+            ExecuteWarn(targetSteamId, targetName, adminSteamId, adminTitle, reason, isRemote: true);
         }
 
         private void ExecuteWarn(string targetSteamId, string targetName, string adminSteamId,
-                                 string adminTitle, string reason)
+                                 string adminTitle, string reason, bool isRemote = false)
         {
             if (!ulong.TryParse(targetSteamId, out var uid)) return;
 
@@ -1455,15 +1472,18 @@ namespace Oxide.Plugins
                 IncrementAdminStat(adminSteamId, "warns");
             IncrementRecap("warns");
 
-            SendEvent("punishment.issued", new Dictionary<string, object>
+            if (!isRemote)
             {
-                ["type"]           = "warn",
-                ["target_steamid"] = targetSteamId,
-                ["target_name"]    = targetName,
-                ["admin_steamid"]  = adminSteamId,
-                ["admin_title"]    = adminTitle,
-                ["reason"]         = reason,
-            });
+                SendEvent("punishment.issued", new Dictionary<string, object>
+                {
+                    ["type"]           = "warn",
+                    ["target_steamid"] = targetSteamId,
+                    ["target_name"]    = targetName,
+                    ["admin_steamid"]  = adminSteamId,
+                    ["admin_title"]    = adminTitle,
+                    ["reason"]         = reason,
+                });
+            }
 
             // Порог предупреждений — автоматический мут и сброс счётчика
             if (warnCount >= _config.MaxWarningsBeforeMute)
@@ -1510,7 +1530,7 @@ namespace Oxide.Plugins
             // Красим ник админа в общем чате — раньше плагин знал, кто админ
             // (_adminsCache), но нигде это не использовал для самого чата в игре,
             // только для служебных объявлений о банах/мутах. Team/Clan не трогаем:
-            // Server.Broadcast ушёл бы всем, а не только команде/клану.
+            // рассылка ушла бы всем, а не только команде/клану.
             if (channelName == "Global" && _adminsCache.TryGetValue(player.UserIDString, out var chatAdmin))
             {
                 // Ник берём у самого игрока (его реальный текущий displayName),
@@ -1519,11 +1539,22 @@ namespace Oxide.Plugins
                 var label = string.IsNullOrEmpty(chatAdmin.Title)
                     ? player.displayName
                     : $"{player.displayName} ({chatAdmin.Title})";
-                Server.Broadcast($"<color=#66ff66>{label}</color>: {message}");
+                // Вместо Server.Broadcast (аватар сервера/пусто) шлём chat.add вручную
+                // каждому клиенту с SteamID самого админа вторым аргументом — движок
+                // Rust сам подтянет его реальную Steam-аватарку (так делают IQChat
+                // и другие плагины через свою команду /rename).
+                BroadcastChatWithAvatar(channel, player.UserIDString, $"<color=#66ff66>{label}</color>: {message}");
                 return false;
             }
 
             return null;
+        }
+
+        /// <summary>Рассылает сообщение всем игрокам с аватаркой конкретного SteamID вместо серверной.</summary>
+        private static void BroadcastChatWithAvatar(ConVar.Chat.ChatChannel channel, string avatarSteamId, string message)
+        {
+            foreach (var p in BasePlayer.activePlayerList)
+                p.SendConsoleCommand("chat.add", channel, avatarSteamId, message);
         }
 
         // ── WS-обработчики (панель → наказание) ──────────────────────
@@ -1535,35 +1566,39 @@ namespace Oxide.Plugins
             var adminTitle = msg["admin_title"]?.ToString() ?? "Администратор";
             var reason     = msg["reason"]?.ToString() ?? "Не указана";
             var duration   = msg["duration"]?.ToObject<int>() ?? 0;
+            var showAvatar = msg["show_avatar"]?.ToObject<bool>() ?? false;
 
             if (string.IsNullOrEmpty(targetId)) return;
 
-            ApplyBanRemote(targetId, adminId, adminTitle, reason, duration);
+            ApplyBanRemote(targetId, adminId, adminTitle, reason, duration, showAvatar, isRemote: true);
         }
 
         private void HandleActionMute(JObject msg)
         {
             var targetId   = msg["target_steamid"]?.ToString();
+            var adminId    = msg["admin_steamid"]?.ToString();
             var adminTitle = msg["admin_title"]?.ToString() ?? "Администратор";
             var reason     = msg["reason"]?.ToString() ?? "Не указана";
             var duration   = msg["duration"]?.ToObject<int>() ?? 0;
+            var showAvatar = msg["show_avatar"]?.ToObject<bool>() ?? false;
 
             var channels = msg["channels"]?.ToObject<List<string>>() ?? new List<string> { "Global" };
 
             if (string.IsNullOrEmpty(targetId)) return;
 
-            ApplyMuteRemote(targetId, adminTitle, reason, duration, new HashSet<string>(channels));
+            ApplyMuteRemote(targetId, adminId, adminTitle, reason, duration, new HashSet<string>(channels), showAvatar);
         }
 
         private void HandleActionWarn(JObject msg)
         {
             var targetId   = msg["target_steamid"]?.ToString();
+            var adminId    = msg["admin_steamid"]?.ToString();
             var adminTitle = msg["admin_title"]?.ToString() ?? "Администратор";
             var reason     = msg["reason"]?.ToString() ?? "Не указана";
 
             if (string.IsNullOrEmpty(targetId)) return;
 
-            ApplyWarnRemote(targetId, adminTitle, reason);
+            ApplyWarnRemote(targetId, adminId, adminTitle, reason);
         }
 
         /// <summary>Снятие наказания (панель → сервер). Часть единой системы наказаний,
@@ -2233,39 +2268,111 @@ namespace Oxide.Plugins
 
         private Dictionary<ulong, string> _playerRulesCache = new Dictionary<ulong, string>();
 
-        internal void ShowRulesScreen(BasePlayer player, string rulesText)
+        /// <summary>Меню выбора: правила сервера или правила подачи репортов. Синяя тема — как у /report.</summary>
+        internal void ShowRulesScreen(BasePlayer player)
         {
             CuiHelper.DestroyUi(player, RULES_PANEL_UI);
 
             var elements = new CuiElementContainer();
             var panel = elements.Add(new CuiPanel
             {
-                Image = { Color = "0.06 0.06 0.06 0.97" },
+                Image = { Color = COL_BG },
+                RectTransform = { AnchorMin = "0.3 0.25", AnchorMax = "0.7 0.75" },
+                CursorEnabled = true
+            }, "Overlay", RULES_PANEL_UI);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Правила", FontSize = 18, Align = TextAnchor.MiddleCenter, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0 0.85", AnchorMax = "1 1" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.rules.server", Color = COL_ACCENT },
+                RectTransform = { AnchorMin = "0.1 0.53", AnchorMax = "0.9 0.75" },
+                Text = { Text = "Правила сервера", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.rules.report", Color = COL_ACCENT },
+                RectTransform = { AnchorMin = "0.1 0.28", AnchorMax = "0.9 0.5" },
+                Text = { Text = "Правила подачи репортов", FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.closerules", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.35 0.06", AnchorMax = "0.65 0.2" },
+                Text = { Text = "Закрыть", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = COL_MUTED }
+            }, panel);
+
+            CuiHelper.AddUi(player, elements);
+        }
+
+        /// <summary>Текст конкретной категории правил — тоже в синей теме, с кнопкой назад в меню.</summary>
+        private void ShowRulesDetailScreen(BasePlayer player, string title, string text)
+        {
+            CuiHelper.DestroyUi(player, RULES_PANEL_UI);
+
+            var elements = new CuiElementContainer();
+            var panel = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_BG },
                 RectTransform = { AnchorMin = "0.2 0.1", AnchorMax = "0.8 0.9" },
                 CursorEnabled = true
             }, "Overlay", RULES_PANEL_UI);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = "ПРАВИЛА СЕРВЕРА", FontSize = 18, Align = TextAnchor.UpperCenter, Color = "0.6 1 0.6 1" },
-                RectTransform = { AnchorMin = "0 0.92", AnchorMax = "1 1" }
+                Text = { Text = title, FontSize = 18, Align = TextAnchor.UpperCenter, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0 0.9", AnchorMax = "1 1" }
             }, panel);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = string.IsNullOrEmpty(rulesText) ? "Правила не установлены." : rulesText,
-                         FontSize = 12, Align = TextAnchor.UpperLeft, Color = "0.9 0.9 0.9 1" },
-                RectTransform = { AnchorMin = "0.03 0.05", AnchorMax = "0.97 0.9" }
+                Text = { Text = string.IsNullOrEmpty(text) ? "Правила не установлены." : text,
+                         FontSize = 12, Align = TextAnchor.UpperLeft, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.03 0.12", AnchorMax = "0.97 0.88" }
             }, panel);
 
             elements.Add(new CuiButton
             {
-                Button = { Command = "overpanel.closerules", Color = "0.3 0.3 0.3 1" },
-                RectTransform = { AnchorMin = "0.4 0.01", AnchorMax = "0.6 0.05" },
-                Text = { Text = "Закрыть", FontSize = 12, Align = TextAnchor.MiddleCenter }
+                Button = { Command = "overpanel.rules.menu", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.35 0.02", AnchorMax = "0.5 0.09" },
+                Text = { Text = "< Назад", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = COL_TEXT }
+            }, panel);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.closerules", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.5 0.02", AnchorMax = "0.65 0.09" },
+                Text = { Text = "Закрыть", FontSize = 12, Align = TextAnchor.MiddleCenter, Color = COL_MUTED }
             }, panel);
 
             CuiHelper.AddUi(player, elements);
+        }
+
+        [ConsoleCommand("overpanel.rules.menu")]
+        private void CmdRulesMenu(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowRulesScreen(player);
+        }
+
+        [ConsoleCommand("overpanel.rules.server")]
+        private void CmdRulesServer(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowRulesDetailScreen(player, "Правила сервера", GetServerRules());
+        }
+
+        [ConsoleCommand("overpanel.rules.report")]
+        private void CmdRulesReport(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null) ShowRulesDetailScreen(player, "Правила подачи репортов", GetReportRules());
         }
 
         [ConsoleCommand("overpanel.closerules")]
@@ -2340,10 +2447,7 @@ namespace Oxide.Plugins
             return first.Length > 42 ? first.Substring(0, 42) + "…" : first;
         }
 
-        /// <summary>
-        /// Корневая панель. Если в data/Overpanel/images/REPORT_SCREEN.png лежит
-        /// картинка (1202×805), она рисуется фоном; иначе — сплошная заливка.
-        /// </summary>
+        /// <summary>Корневая панель /report — сплошная заливка.</summary>
         private string AddReportRoot(CuiElementContainer elements, string uiName)
         {
             var panel = elements.Add(new CuiPanel
@@ -2353,55 +2457,16 @@ namespace Oxide.Plugins
                 CursorEnabled = true
             }, "Overlay", uiName);
 
-            if (_reportBgCrc.HasValue)
-            {
-                elements.Add(new CuiElement
-                {
-                    Parent = panel,
-                    Components =
-                    {
-                        new CuiRawImageComponent { Png = _reportBgCrc.Value.ToString(), Color = "1 1 1 1" },
-                        new CuiRectTransformComponent { AnchorMin = "0 0", AnchorMax = "1 1" }
-                    }
-                });
-            }
-
             return panel;
         }
 
         /// <summary>Общая шапка: заголовок, «Правила», крестик.</summary>
-        // Facepunch Rust.Community Icons.cs: Shield = 61746 — кодпоинт в кастомном
-        // иконочном шрифте, а не спрайт/итем-айди. Шрифт для рендера этого диапазона
-        // подтвердить не удалось (Icons.cs — из внутренних тулов Facepunch, не факт,
-        // что тот же шрифт стоит у обычных игроков) — ПРОВЕРИТЬ на реальном клиенте
-        // первым делом; если иконка не отрисуется, скорее всего дело в Font ниже.
-        private const int ICON_SHIELD = 61746;
-
         private void AddReportHeader(CuiElementContainer elements, string parent)
         {
-            // Акцентный квадрат-логотип убран, вместо него — иконка щита из
-            // кастомного шрифта (см. ICON_SHIELD выше)
-            elements.Add(new CuiElement
-            {
-                Parent = parent,
-                Components =
-                {
-                    new CuiTextComponent
-                    {
-                        Text = char.ConvertFromUtf32(ICON_SHIELD),
-                        Font = "RobotoCondensed-Bold.ttf",
-                        FontSize = 22,
-                        Align = TextAnchor.MiddleCenter,
-                        Color = COL_ACCENT,
-                    },
-                    new CuiRectTransformComponent { AnchorMin = "0.03 0.928", AnchorMax = "0.065 0.978" },
-                },
-            });
-
             elements.Add(new CuiLabel
             {
                 Text = { Text = "Система репортов", FontSize = 20, Align = TextAnchor.LowerLeft, Color = COL_TEXT },
-                RectTransform = { AnchorMin = "0.075 0.938", AnchorMax = "0.6 0.982" }
+                RectTransform = { AnchorMin = "0.03 0.938", AnchorMax = "0.6 0.982" }
             }, parent);
 
             elements.Add(new CuiLabel
@@ -2803,6 +2868,77 @@ namespace Oxide.Plugins
             CuiHelper.AddUi(player, elements);
         }
 
+        /// <summary>Экран описания проблемы — открывается после выбора категории.</summary>
+        private void ShowReportDescribeScreen(BasePlayer player, string category)
+        {
+            CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
+            CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
+
+            var elements = new CuiElementContainer();
+            var root = AddReportRoot(elements, REPORT_DETAIL_PANEL_UI);
+            AddReportHeader(elements, root);
+
+            var pane = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_CARD },
+                RectTransform = { AnchorMin = "0.018 0.02", AnchorMax = "0.982 0.885" }
+            }, root);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = $"Категория: {category}", FontSize = 15, Align = TextAnchor.MiddleLeft, Color = COL_TEXT },
+                RectTransform = { AnchorMin = "0.03 0.9", AnchorMax = "0.7 0.97" }
+            }, pane);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Command = "overpanel.report.category.back", Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.8 0.9", AnchorMax = "0.97 0.965" },
+                Text = { Text = "< Назад", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = COL_TEXT }
+            }, pane);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Опишите ситуацию кратко:", FontSize = 12, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                RectTransform = { AnchorMin = "0.03 0.78", AnchorMax = "0.7 0.83" }
+            }, pane);
+
+            var inputBg = elements.Add(new CuiPanel
+            {
+                Image = { Color = COL_CARD_ALT },
+                RectTransform = { AnchorMin = "0.03 0.55", AnchorMax = "0.97 0.77" }
+            }, pane);
+
+            elements.Add(new CuiElement
+            {
+                Parent = inputBg,
+                Components =
+                {
+                    new CuiInputFieldComponent
+                    {
+                        Command = "overpanel.report.describe.submit",
+                        FontSize = 12,
+                        Color = COL_TEXT,
+                        CharsLimit = 400,
+                        NeedsKeyboard = true,
+                        Align = TextAnchor.UpperLeft,
+                        Text = "",
+                    },
+                    new CuiRectTransformComponent { AnchorMin = "0.02 0.06", AnchorMax = "0.98 0.94" }
+                }
+            });
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = "Доказательства: загрузите видео на Яндекс.Диск или Dropbox и вставьте ссылку прямо в текст.\n"
+                              + "Enter — отправить обращение.",
+                         FontSize = 11, Align = TextAnchor.UpperLeft, Color = COL_MUTED },
+                RectTransform = { AnchorMin = "0.03 0.4", AnchorMax = "0.97 0.53" }
+            }, pane);
+
+            CuiHelper.AddUi(player, elements);
+        }
+
         /// <summary>Подсказка по вложениям (загрузить файл из игры нельзя).</summary>
         private void ShowReportAttachHelp(BasePlayer player)
         {
@@ -2875,13 +3011,35 @@ namespace Oxide.Plugins
             if (index < 0 || index >= ReportCategories.Length) return;
 
             _pendingReportCategory[player.userID] = ReportCategories[index];
+            ShowReportDescribeScreen(player, ReportCategories[index]);
+        }
+
+        [ConsoleCommand("overpanel.report.category.back")]
+        private void CmdReportCategoryBack(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+            _pendingReportCategory.Remove(player.userID);
+            ShowReportCreateScreen(player);
+        }
+
+        [ConsoleCommand("overpanel.report.describe.submit")]
+        private void CmdReportDescribeSubmit(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null) return;
+
+            var words = new List<string>();
+            if (arg.Args != null)
+                for (var i = 0; i < arg.Args.Length; i++) words.Add(arg.GetString(i));
+            var text = string.Join(" ", words).Trim();
+
+            if (string.IsNullOrEmpty(text)) return;
 
             CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
             CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
 
-            SendReply(player,
-                $"<color=#5599FF>[Overpanel]</color> Категория: {ReportCategories[index]}.\n" +
-                "Опишите проблему командой: /report <текст>. Ссылку на доказательства можно вставить прямо в текст.");
+            SubmitReport(player, null, text);
         }
 
         [ConsoleCommand("overpanel.report.rules")]
@@ -2891,7 +3049,7 @@ namespace Oxide.Plugins
             if (player == null) return;
             CuiHelper.DestroyUi(player, REPORT_LIST_PANEL_UI);
             CuiHelper.DestroyUi(player, REPORT_DETAIL_PANEL_UI);
-            ShowRulesScreen(player, GetServerRules());
+            ShowRulesScreen(player);
         }
 
         [ConsoleCommand("overpanel.report.attach")]
@@ -3284,7 +3442,7 @@ namespace Oxide.Plugins
             var basePlayer = player.Object as BasePlayer;
             if (basePlayer == null) return;
 
-            ShowRulesScreen(basePlayer, GetServerRules());
+            ShowRulesScreen(basePlayer);
         }
 
         private void CmdPanel(IPlayer player, string command, string[] args)
@@ -3294,28 +3452,48 @@ namespace Oxide.Plugins
         }
 
         // ── Правила сервера ──────────────────────────────────────────
+        // Два независимых текста (ServerRules.rulesText / reportRulesText в БД
+        // панели) — приходят из панели через WS-экшен rules.update, хранятся
+        // локально на случай переподключения/перезагрузки плагина.
 
         private string GetServerRules()
         {
+            return ReadRulesFile().TryGetValue("rules", out var text) ? text : "";
+        }
+
+        private string GetReportRules()
+        {
+            return ReadRulesFile().TryGetValue("report_rules", out var text) ? text : "";
+        }
+
+        private Dictionary<string, string> ReadRulesFile()
+        {
             try
             {
-                var rules = Interface.Oxide.DataFileSystem
-                    .ReadObject<Dictionary<string, string>>("Overpanel/ServerRules");
-
-                return rules != null && rules.TryGetValue("text", out var text) ? text : "";
+                return Interface.Oxide.DataFileSystem
+                    .ReadObject<Dictionary<string, string>>("Overpanel/ServerRules")
+                    ?? new Dictionary<string, string>();
             }
             catch
             {
-                return "";
+                return new Dictionary<string, string>();
             }
         }
 
-        internal void UpdateServerRules(string text)
+        internal void UpdateServerRules(string rulesText, string reportRulesText)
         {
             Interface.Oxide.DataFileSystem.WriteObject("Overpanel/ServerRules",
-                new Dictionary<string, string> { ["text"] = text });
+                new Dictionary<string, string> { ["rules"] = rulesText, ["report_rules"] = reportRulesText });
 
             Puts("[Overpanel] Правила сервера обновлены.");
+        }
+
+        /// <summary>Пришло из панели: rules.update — синхронизация текстов правил.</summary>
+        private void HandleActionRulesUpdate(JObject msg)
+        {
+            var rulesText = msg["rules_text"]?.ToString() ?? "";
+            var reportRulesText = msg["report_rules_text"]?.ToString() ?? "";
+            UpdateServerRules(rulesText, reportRulesText);
         }
 
         // ── Фидбек ───────────────────────────────────────────────────
@@ -3728,9 +3906,13 @@ namespace Oxide.Plugins
             });
         }
 
-        private void ChatAlert(string message)
+        /// <summary>avatarSteamId != null — вместо серверной аватарки показать реальную Steam-аватарку этого SteamID (настройка профиля "Отображать свою аватарку в чате").</summary>
+        private void ChatAlert(string message, string avatarSteamId = null)
         {
-            Server.Broadcast(message);
+            if (!string.IsNullOrEmpty(avatarSteamId))
+                BroadcastChatWithAvatar(ConVar.Chat.ChatChannel.Global, avatarSteamId, message);
+            else
+                Server.Broadcast(message);
         }
 
         private void NotifyAdminsInGame(string message)
@@ -4007,37 +4189,6 @@ namespace Oxide.Plugins
             catch (Exception ex)
             {
                 PrintWarning($"[Overpanel] IQReportSystem sync failed: {ex.Message}");
-            }
-        }
-
-        // ======= Локальный фон /report =======
-
-        private uint? _reportBgCrc;
-
-        /// <summary>
-        /// Грузит data/Overpanel/images/REPORT_SCREEN.png (1202×805) через FileStorage,
-        /// без внешнего хостинга и без ImageLibrary — просто кладёте файл на сервер.
-        /// Если файла нет, экраны /report используют сплошную заливку.
-        /// </summary>
-        private void LoadLocalReportBackground()
-        {
-            var path = Path.Combine(Interface.Oxide.DataDirectory, "Overpanel", "images", "REPORT_SCREEN.png");
-            if (!File.Exists(path))
-            {
-                _reportBgCrc = null;
-                return;
-            }
-
-            try
-            {
-                var bytes = File.ReadAllBytes(path);
-                _reportBgCrc = FileStorage.server.Store(bytes, FileStorage.Type.png, CommunityEntity.ServerInstance.net.ID);
-                Puts("[Overpanel] Фон /report загружен из data/Overpanel/images/REPORT_SCREEN.png");
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"[Overpanel] Не удалось загрузить REPORT_SCREEN.png: {ex.Message}");
-                _reportBgCrc = null;
             }
         }
 
