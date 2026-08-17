@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.2.0")]
+    [Info("Overpanel", "Gooseoma", "1.2.1")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -135,6 +135,7 @@ namespace Oxide.Plugins
                 ["plugin_version"] = PLUGIN_VERSION,
                 // Нужно панели, чтобы перевести x/z из player.position_batch в проценты на карте
                 ["world_size"]     = ConVar.Server.worldsize,
+                ["map_seed"]       = ConVar.Server.seed,
                 // Имя могли сменить после привязки — держим панель в курсе
                 ["name"]           = GetEffectiveServerName(),
             });
@@ -166,7 +167,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.2.0";
+        internal const string PLUGIN_VERSION = "1.2.1";
 
         internal PluginConfig _config;
 
@@ -2076,6 +2077,15 @@ namespace Oxide.Plugins
                 fake.Spawn();
 
                 fake.displayName = "";
+
+                // Без этих флагов клиент считает носителя спящим/неподключённым
+                // игроком и НЕ создаёт для него голосовой источник: модель видно,
+                // а VoiceData от неё молча игнорируется. Ровно этим и объяснялось
+                // "бот появляется, а звука нет".
+                fake.SetPlayerFlag(BasePlayer.PlayerFlags.ReceivingSnapshot, false);
+                fake.SetPlayerFlag(BasePlayer.PlayerFlags.Sleeping, false);
+                fake.SetPlayerFlag(BasePlayer.PlayerFlags.Connected, true);
+
                 fake.SendNetworkUpdateImmediate();
 
                 return fake;
@@ -2109,19 +2119,31 @@ namespace Oxide.Plugins
             byte[][] frames,
             string sessionId)
         {
-            var wait = new WaitForSeconds(FRAME_INTERVAL);
+            // Раньше здесь было yield return new WaitForSeconds(0.02) на каждый фрейм.
+            // Корутина не может проснуться чаще кадра сервера, поэтому на 30 FPS
+            // 20-мс фреймы уходили раз в ~33 мс: дорожка растягивалась в полтора
+            // раза, а буфер клиента постоянно голодал. Теперь темп считаем от
+            // реального времени и досылаем столько фреймов, сколько уже "должно"
+            // было уйти — на любой частоте кадров звук идёт ровно 1:1.
+            var startedAt  = UnityEngine.Time.realtimeSinceStartup;
             var sentFrames = 0;
 
-            for (var i = 0; i < frames.Length; i++)
+            while (sentFrames < frames.Length)
             {
                 // Игрок вышел или проверка отменена — прерываем
                 if (target == null || !target.IsConnected) break;
                 if (carrier == null || carrier.IsDestroyed) break;
 
-                SendVoiceFrame(target, carrier, frames[i]);
-                sentFrames++;
+                var elapsed = UnityEngine.Time.realtimeSinceStartup - startedAt;
+                var due = Mathf.Min(frames.Length, Mathf.CeilToInt(elapsed / FRAME_INTERVAL) + 1);
 
-                yield return wait;
+                while (sentFrames < due)
+                {
+                    SendVoiceFrame(target, carrier, frames[sentFrames]);
+                    sentFrames++;
+                }
+
+                yield return null;
             }
 
             KillVoiceCarrier(carrier);
@@ -2153,7 +2175,9 @@ namespace Oxide.Plugins
                 writer.PacketID(Message.Type.VoiceData);
                 writer.EntityID(carrier.net.ID);
                 writer.BytesWithSize(frame);
-                writer.Send(new SendInfo(target.net.connection));
+                // Приоритет как в самой игре (BasePlayer.OnReceivedVoice): без него
+                // голосовые пакеты уходят обычной очередью и могут отставать/теряться
+                writer.Send(new SendInfo(target.net.connection) { priority = Priority.Immediate });
             }
             catch (Exception ex)
             {
