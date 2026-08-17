@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.3.0")]
+    [Info("Overpanel", "Gooseoma", "1.5.0")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -167,7 +167,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.3.0";
+        internal const string PLUGIN_VERSION = "1.5.0";
 
         internal PluginConfig _config;
 
@@ -884,6 +884,7 @@ namespace Oxide.Plugins
 
                 case "check.start":       HandleActionCheckStart(msg); break;
                 case "check.stop":        HandleActionCheckStop(msg);  break;
+                case "check.verdict":     HandleActionCheckVerdict(msg); break;
 
                 case "chat.send":         HandleActionChatSend(msg);   break;
 
@@ -1305,7 +1306,7 @@ namespace Oxide.Plugins
 
             var title = string.IsNullOrEmpty(ban.AdminTitle) ? "Администратор" : ban.AdminTitle;
             var name = string.IsNullOrEmpty(ban.AdminName) ? "" : $" {ban.AdminName}";
-            return $"Вы были заблокированы {title}{name} по причине {ban.Reason}. Дата разбана: {FormatUnbanDate(ban.Expires)}";
+            return $"{title}{name} заблокировал вас по причине {ban.Reason}. Дата разбана: {FormatUnbanDate(ban.Expires)}";
         }
 
         /// <summary>Бан от администратора, находящегося в игре.</summary>
@@ -1360,7 +1361,7 @@ namespace Oxide.Plugins
                 var title = string.IsNullOrEmpty(adminTitle) ? "Администратор" : adminTitle;
                 var nick = ResolveAdminName(adminSteamId);
                 var nickPart = string.IsNullOrEmpty(nick) ? "" : $" {nick}";
-                target.Kick($"Вы были заблокированы {title}{nickPart} по причине {reason}. " +
+                target.Kick($"{title}{nickPart} заблокировал вас по причине {reason}. " +
                             $"Дата разбана: {FormatUnbanDate(duration > 0 ? DateTime.UtcNow.AddSeconds(duration) : DateTime.MaxValue)}");
             }
 
@@ -1700,7 +1701,6 @@ namespace Oxide.Plugins
             public Timer  ConnectTimer  { get; set; }
         }
 
-        private const int CHECK_CONNECT_TIMEOUT_SEC = 300;
 
         // ── Запуск из панели ─────────────────────────────────────────
 
@@ -1780,16 +1780,9 @@ namespace Oxide.Plugins
                 StartedAt     = DateTime.UtcNow,
             };
 
-            session.ConnectTimer = timer.Once(CHECK_CONNECT_TIMEOUT_SEC, () =>
-            {
-                if (!_checkSessions.ContainsKey(target.UserIDString)) return;
-                if (session.CheckerConnected) return;
-
-                BanForCheckFailure(target, adminSteamId, adminTitle,
-                    "Не запустил Overpanel Checker вовремя");
-                EndCheck(target.UserIDString);
-            });
-
+            // Автобан за "не запустил чекер вовремя" убран: он срабатывал ложно
+            // и банил невиновных. Решение по проверке теперь выносит админ вручную
+            // кнопкой «Вынести решение» в панели (check.verdict).
             _checkSessions[target.UserIDString] = session;
 
             // Оверлей и голос запускаются вместе: игрок видит текст и слышит диктора
@@ -1835,26 +1828,15 @@ namespace Oxide.Plugins
                 session.CheckerConnected = true;
         }
 
-        private void BanForCheckFailure(BasePlayer target, string adminSteamId, string adminTitle, string reason)
-        {
-            if (target == null) return;
-
-            ApplyBanRemote(target.UserIDString, adminSteamId, adminTitle, reason, 0);
-        }
-
         // ── Реакция на выход игрока ──────────────────────────────────
 
         object OnUserDisconnected(Oxide.Core.Libraries.Covalence.IPlayer player, string reason)
         {
             if (_checkSessions.TryGetValue(player.Id, out var session))
             {
-                var target = BasePlayer.Find(player.Id);
-                if (target != null)
-                {
-                    ApplyBanRemote(player.Id, session.AdminSteamId, session.AdminTitle,
-                        "Покинул сервер во время проверки", 0);
-                }
-
+                // Автобан за выход во время проверки убран — слишком много ложных
+                // срабатываний (краш, разрыв связи). Сессия просто закрывается,
+                // решение принимает админ вручную.
                 StopVoiceStream(player.Id);
                 session.ConnectTimer?.Destroy();
                 _checkSessions.Remove(player.Id);
@@ -1899,6 +1881,34 @@ namespace Oxide.Plugins
             EndCheck(targetId);
         }
 
+        /// <summary>
+        /// Решение админа по проверке из панели: violation / clean / cancel.
+        /// Сам бан при violation выдаёт панель отдельным punishment.ban — здесь
+        /// только объявление в чат и снятие оверлея, чтобы наказание,
+        /// как и все прочие, было записано в БД панели.
+        /// </summary>
+        private void HandleActionCheckVerdict(JObject msg)
+        {
+            var targetId = msg["target_steamid"]?.ToString();
+            var verdict  = msg["verdict"]?.ToString();
+            if (string.IsNullOrEmpty(targetId)) return;
+
+            var target = BasePlayer.Find(targetId);
+            var targetName = target?.displayName ?? msg["target_name"]?.ToString() ?? targetId;
+
+            if (verdict == "violation")
+            {
+                ChatAlert($"<color=#FF4444>Проверка игрока {targetName} завершена, нарушения обнаружены!</color>");
+            }
+            else if (verdict == "clean")
+            {
+                ChatAlert($"<color=#66ff66>Проверка игрока {targetName} закончилась, нарушения не обнаружены</color>");
+            }
+            // cancel — молча, без объявлений
+
+            EndCheck(targetId);
+        }
+
         #endregion
 
         #region Audio
@@ -1913,13 +1923,7 @@ namespace Oxide.Plugins
         /// </summary>
 
         private const float FRAME_INTERVAL   = 0.02f;   // 20 мс — размер Opus-фрейма
-        private const float FAKE_SPAWN_DIST  = 1.2f;    // на сколько метров позади цели
-        private const float FAKE_SPAWN_UP    = 0.5f;
         private const int   MAX_FRAME_SIZE   = 2048;
-
-        /// SteamID носителя голоса. Клиент заводит голосовой источник только на
-        /// игрока с валидным id, а у сущности из CreateEntity он нулевой.
-        private const ulong VOICE_CARRIER_STEAMID = 76561190000000000UL;
 
         /// Пауза перед первым фреймом: клиенту нужно успеть создать сущность
         /// носителя, иначе первые пакеты приходят «в никуда».
@@ -1930,7 +1934,7 @@ namespace Oxide.Plugins
 
         // Активные стримы: steamId цели → корутина
         private readonly Dictionary<string, Coroutine> _activeStreams = new Dictionary<string, Coroutine>();
-        private readonly Dictionary<string, BasePlayer> _fakePlayers = new Dictionary<string, BasePlayer>();
+        private readonly Dictionary<string, VoiceCarrier> _fakePlayers = new Dictionary<string, VoiceCarrier>();
 
         // ── Чтение файла фреймов ─────────────────────────────────────
 
@@ -2021,17 +2025,23 @@ namespace Oxide.Plugins
 
             StopVoiceStream(target.UserIDString);
 
-            var fake = SpawnVoiceCarrier(target);
-            if (fake == null)
+            VoiceCarrier carrier;
+            try
             {
+                carrier = new VoiceCarrier(target);
+                carrier.Send();
+            }
+            catch (Exception ex)
+            {
+                PrintError($"[Overpanel] Не удалось создать носитель голоса: {ex.Message}");
                 SendCheckTextFallback(target, lang);
                 return;
             }
 
-            _fakePlayers[target.UserIDString] = fake;
+            _fakePlayers[target.UserIDString] = carrier;
 
             var coroutine = ServerMgr.Instance.StartCoroutine(
-                StreamVoiceFrames(target, fake, frames, sessionId));
+                StreamVoiceFrames(target, carrier, frames, sessionId));
 
             _activeStreams[target.UserIDString] = coroutine;
         }
@@ -2045,82 +2055,139 @@ namespace Oxide.Plugins
                 _activeStreams.Remove(steamId);
             }
 
-            if (_fakePlayers.TryGetValue(steamId, out var fake))
+            if (_fakePlayers.TryGetValue(steamId, out var carrier))
             {
-                KillVoiceCarrier(fake);
+                try { carrier.Destroy(); } catch { /* игрок мог уже выйти */ }
                 _fakePlayers.Remove(steamId);
             }
         }
 
         // ── Фейковый носитель голоса ─────────────────────────────────
 
-        private BasePlayer SpawnVoiceCarrier(BasePlayer target)
+        /// <summary>
+        /// Носитель голоса, существующий ТОЛЬКО у клиента цели.
+        ///
+        /// Реальная сущность на сервере не спавнится вовсе: пакетом Entities
+        /// цели отправляется невидимый стул, прицепленный к кости головы, и
+        /// «игрок», сидящий на этом стуле. Голос идёт от него, то есть прямо
+        /// у уха слушателя, и никто другой ни модели, ни звука не получает.
+        ///
+        /// Прошлые попытки спавнить настоящий player.prefab не работали:
+        /// клиент видел модель, но голосовой источник для неё не заводил.
+        /// </summary>
+        internal class VoiceCarrier
         {
-            try
+            // Кость головы игрока — к ней цепляется стул
+            private const uint HEAD_BONE     = 2822582055;
+            private const uint CHAIR_PREFAB  = 624857933;
+
+            public ulong SpeakerUid { get; } = Net.sv.TakeUID();
+            private readonly ulong _chairUid = Net.sv.TakeUID();
+            private readonly BasePlayer _listener;
+
+            public VoiceCarrier(BasePlayer listener)
             {
-                // Клиент воспроизводит VoiceData только от сущности, которую он
-                // уже получил по сети, поэтому носитель обязан быть заспавнен
-                // и отправлен цели. Ставим его вплотную за спину, чтобы игрок
-                // не увидел модель в поле зрения, и убиваем сразу после стрима.
-                var forward = target.eyes != null
-                    ? target.eyes.BodyForward()
-                    : target.transform.forward;
+                _listener = listener;
+            }
 
-                var behind = target.transform.position
-                             - forward * FAKE_SPAWN_DIST
-                             + Vector3.up * FAKE_SPAWN_UP;
+            public void Send()
+            {
+                SendEntity(BuildChair());
+                SendEntity(BuildSpeaker());
+            }
 
-                var entity = GameManager.server.CreateEntity(
-                    "assets/prefabs/player/player.prefab",
-                    behind,
-                    Quaternion.LookRotation(forward));
+            public void Destroy()
+            {
+                DestroyEntity(SpeakerUid);
+                DestroyEntity(_chairUid);
+            }
 
-                var fake = entity as BasePlayer;
-                if (fake == null)
+            private ProtoBuf.Entity BuildSpeaker() => new ProtoBuf.Entity
+            {
+                baseNetworkable = new ProtoBuf.BaseNetworkable
                 {
-                    entity?.Kill();
-                    return null;
-                }
+                    prefabID = _listener.prefabID,
+                    group    = BaseNetworkable.GlobalNetworkGroup.ID,
+                    uid      = new NetworkableId(SpeakerUid),
+                },
+                baseEntity = new ProtoBuf.BaseEntity
+                {
+                    flags  = 0,
+                    pos    = Vector3.zero,
+                    rot    = Vector3.zero,
+                    skinid = 0,
+                    time   = UnityEngine.Time.time,
+                },
+                baseCombat = new ProtoBuf.BaseCombat
+                {
+                    health = 10000,
+                    state  = (int)BaseCombatEntity.LifeState.Alive,
+                },
+                basePlayer = new ProtoBuf.BasePlayer
+                {
+                    health = 10000,
+                    modelState = new ModelState
+                    {
+                        mounted  = true,
+                        onground = true,
+                        ducked   = true,
+                        prone    = true,
+                    },
+                    userid      = SpeakerUid,
+                    name        = "OVERPANEL_VOICE",
+                    playerFlags = 0,
+                    mounted     = new NetworkableId(_chairUid),
+                },
+                parent = new ProtoBuf.ParentInfo
+                {
+                    uid  = new NetworkableId(_chairUid),
+                    bone = 0,
+                },
+            };
 
-                // SteamID обязателен ДО Spawn(): клиент опознаёт говорящего именно
-                // по нему и заводит голосовой источник на игрока с валидным id.
-                // У сущности из CreateEntity userID = 0, поэтому входящий VoiceData
-                // просто некому было проигрывать.
-                fake.userID = VOICE_CARRIER_STEAMID;
-                fake.UserIDString = fake.userID.ToString();
-                fake.displayName = "";
-
-                fake.Spawn();
-
-                // Без этих флагов клиент считает носителя спящим/неподключённым
-                // игроком и НЕ создаёт для него голосовой источник: модель видно,
-                // а VoiceData от неё молча игнорируется.
-                fake.SetPlayerFlag(BasePlayer.PlayerFlags.ReceivingSnapshot, false);
-                fake.SetPlayerFlag(BasePlayer.PlayerFlags.Sleeping, false);
-                fake.SetPlayerFlag(BasePlayer.PlayerFlags.Connected, true);
-
-                fake.SendNetworkUpdateImmediate();
-
-                return fake;
-            }
-            catch (Exception ex)
+            private ProtoBuf.Entity BuildChair() => new ProtoBuf.Entity
             {
-                PrintError($"[Overpanel] Не удалось создать носитель голоса: {ex.Message}");
-                return null;
-            }
-        }
+                baseNetworkable = new ProtoBuf.BaseNetworkable
+                {
+                    prefabID = CHAIR_PREFAB,
+                    group    = BaseNetworkable.GlobalNetworkGroup.ID,
+                    uid      = new NetworkableId(_chairUid),
+                },
+                baseEntity = new ProtoBuf.BaseEntity
+                {
+                    flags  = 0,
+                    pos    = new Vector3(0, 0.5f, -2.3f),
+                    rot    = new Vector3(90, 180, 180),
+                    skinid = 0,
+                    time   = UnityEngine.Time.time,
+                },
+                parent = new ProtoBuf.ParentInfo
+                {
+                    uid  = _listener.net.ID,
+                    bone = HEAD_BONE,
+                },
+            };
 
-        private void KillVoiceCarrier(BasePlayer fake)
-        {
-            if (fake == null || fake.IsDestroyed) return;
+            private void SendEntity(ProtoBuf.Entity entity)
+            {
+                if (_listener?.net?.connection == null) return;
 
-            try
-            {
-                fake.Kill();
+                var write = Net.sv.StartWrite();
+                write.PacketID(Message.Type.Entities);
+                write.UInt32(++_listener.net.connection.validate.entityUpdates);
+                entity.WriteToStream(write);
+                write.Send(new SendInfo(_listener.net.connection));
             }
-            catch (Exception ex)
+
+            private void DestroyEntity(ulong uid)
             {
-                PrintWarning($"[Overpanel] Ошибка удаления носителя голоса: {ex.Message}");
+                if (_listener?.net?.connection == null) return;
+
+                var write = Net.sv.StartWrite();
+                write.PacketID(Message.Type.EntityDestroy);
+                write.UInt64(uid);
+                write.UInt8(0);
+                write.Send(new SendInfo(_listener.net.connection));
             }
         }
 
@@ -2128,7 +2195,7 @@ namespace Oxide.Plugins
 
         private IEnumerator StreamVoiceFrames(
             BasePlayer target,
-            BasePlayer carrier,
+            VoiceCarrier carrier,
             byte[][] frames,
             string sessionId)
         {
@@ -2147,7 +2214,6 @@ namespace Oxide.Plugins
             {
                 // Игрок вышел или проверка отменена — прерываем
                 if (target == null || !target.IsConnected) break;
-                if (carrier == null || carrier.IsDestroyed) break;
 
                 var elapsed = UnityEngine.Time.realtimeSinceStartup - startedAt;
                 var due = Mathf.Min(frames.Length, Mathf.CeilToInt(elapsed / FRAME_INTERVAL) + 1);
@@ -2161,7 +2227,7 @@ namespace Oxide.Plugins
                 yield return null;
             }
 
-            KillVoiceCarrier(carrier);
+            try { carrier.Destroy(); } catch { /* игрок мог выйти */ }
             _fakePlayers.Remove(target?.UserIDString ?? "");
             _activeStreams.Remove(target?.UserIDString ?? "");
 
@@ -2180,7 +2246,7 @@ namespace Oxide.Plugins
         /// Формирует пакет VoiceData так же, как это делает настоящий клиент,
         /// и шлёт его только целевому игроку.
         /// </summary>
-        private void SendVoiceFrame(BasePlayer target, BasePlayer carrier, byte[] frame)
+        private void SendVoiceFrame(BasePlayer target, VoiceCarrier carrier, byte[] frame)
         {
             if (target.net?.connection == null) return;
 
@@ -2188,7 +2254,11 @@ namespace Oxide.Plugins
             {
                 var writer = Net.sv.StartWrite();
                 writer.PacketID(Message.Type.VoiceData);
-                writer.EntityID(carrier.net.ID);
+                // Именно UInt64, а не EntityID: носитель — «виртуальная» сущность,
+                // существующая только у клиента, и её uid мы выдали сами через
+                // Net.sv.TakeUID(). EntityID писал бы структуру NetworkableId,
+                // которую клиент в этом пакете не ждёт.
+                writer.UInt64(carrier.SpeakerUid);
                 writer.BytesWithSize(frame);
                 // Приоритет как в самой игре (BasePlayer.OnReceivedVoice): без него
                 // голосовые пакеты уходят обычной очередью и могут отставать/теряться
