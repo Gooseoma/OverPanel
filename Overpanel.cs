@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.5.0")]
+    [Info("Overpanel", "Gooseoma", "1.5.1")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -167,7 +167,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.5.0";
+        internal const string PLUGIN_VERSION = "1.5.1";
 
         internal PluginConfig _config;
 
@@ -1922,7 +1922,11 @@ namespace Oxide.Plugins
         /// с интервалом 20 мс — ровно так, как их шлёт настоящий клиент.
         /// </summary>
 
-        private const float FRAME_INTERVAL   = 0.02f;   // 20 мс — размер Opus-фрейма
+        // Длительность одного Opus-пакета в файлах check_*.bin. Файлы записаны
+        // в том же профиле, что использует сам клиент Rust (SILK Wideband,
+        // стерео, мультифрейм по 60 мс). Раньше здесь стояло 20 мс под старые
+        // файлы в профиле Hybrid Fullband — их клиент не проигрывал вовсе.
+        private const float FRAME_INTERVAL   = 0.06f;
         private const int   MAX_FRAME_SIZE   = 2048;
 
         /// Пауза перед первым фреймом: клиенту нужно успеть создать сущность
