@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.2.1")]
+    [Info("Overpanel", "Gooseoma", "1.3.0")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -167,7 +167,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.2.1";
+        internal const string PLUGIN_VERSION = "1.3.0";
 
         internal PluginConfig _config;
 
@@ -1917,6 +1917,14 @@ namespace Oxide.Plugins
         private const float FAKE_SPAWN_UP    = 0.5f;
         private const int   MAX_FRAME_SIZE   = 2048;
 
+        /// SteamID носителя голоса. Клиент заводит голосовой источник только на
+        /// игрока с валидным id, а у сущности из CreateEntity он нулевой.
+        private const ulong VOICE_CARRIER_STEAMID = 76561190000000000UL;
+
+        /// Пауза перед первым фреймом: клиенту нужно успеть создать сущность
+        /// носителя, иначе первые пакеты приходят «в никуда».
+        private const float VOICE_WARMUP_SEC = 0.35f;
+
         // Кеш распарсенных фреймов: путь → фреймы. Читаем файл один раз.
         private readonly Dictionary<string, byte[][]> _audioCache = new Dictionary<string, byte[][]>();
 
@@ -2074,14 +2082,19 @@ namespace Oxide.Plugins
                     return null;
                 }
 
-                fake.Spawn();
-
+                // SteamID обязателен ДО Spawn(): клиент опознаёт говорящего именно
+                // по нему и заводит голосовой источник на игрока с валидным id.
+                // У сущности из CreateEntity userID = 0, поэтому входящий VoiceData
+                // просто некому было проигрывать.
+                fake.userID = VOICE_CARRIER_STEAMID;
+                fake.UserIDString = fake.userID.ToString();
                 fake.displayName = "";
+
+                fake.Spawn();
 
                 // Без этих флагов клиент считает носителя спящим/неподключённым
                 // игроком и НЕ создаёт для него голосовой источник: модель видно,
-                // а VoiceData от неё молча игнорируется. Ровно этим и объяснялось
-                // "бот появляется, а звука нет".
+                // а VoiceData от неё молча игнорируется.
                 fake.SetPlayerFlag(BasePlayer.PlayerFlags.ReceivingSnapshot, false);
                 fake.SetPlayerFlag(BasePlayer.PlayerFlags.Sleeping, false);
                 fake.SetPlayerFlag(BasePlayer.PlayerFlags.Connected, true);
@@ -2125,6 +2138,8 @@ namespace Oxide.Plugins
             // раза, а буфер клиента постоянно голодал. Теперь темп считаем от
             // реального времени и досылаем столько фреймов, сколько уже "должно"
             // было уйти — на любой частоте кадров звук идёт ровно 1:1.
+            yield return new WaitForSeconds(VOICE_WARMUP_SEC);
+
             var startedAt  = UnityEngine.Time.realtimeSinceStartup;
             var sentFrames = 0;
 
@@ -2188,8 +2203,8 @@ namespace Oxide.Plugins
         private void SendCheckTextFallback(BasePlayer player, string lang)
         {
             var msg = lang == "en"
-                ? "[Overpanel] You have been called for a check! Launch Overpanel Checker."
-                : "[Overpanel] Вы вызваны на проверку! Запустите Overpanel Checker.";
+                ? "[Overpanel] You have been summoned for a staff check! Provide your Discord: /discord YourDiscord"
+                : "[Overpanel] Вы были вызваны на проверку! Предоставьте ваш Discord: /discord ВашДискорд";
 
             SendReply(player, msg);
         }
@@ -2225,42 +2240,61 @@ namespace Oxide.Plugins
             CuiHelper.DestroyUi(player, CHECK_PANEL_UI);
 
             bool isRu = GetPlayerLanguage(player) == "ru";
-            string title    = isRu ? "ПРОВЕРКА" : "CHECK";
-            string line1    = isRu ? "К вам применена проверка." : "You are being checked.";
-            string line2    = isRu ? "Не покидайте сервер и запустите Overpanel Checker." : "Do not leave the server and launch Overpanel Checker.";
-            string discord  = isRu ? "Введите /discord ВашДискорд" : "Type /discord YourDiscord";
+
+            // Цветные куски — обычная rich-text разметка Unity внутри CuiLabel
+            string title = isRu
+                ? "Вы были вызваны на проверку"
+                : "You have been summoned for a staff check";
+            string line1 = isRu
+                ? "Вы превысили максимальное допустимое количество жалоб"
+                : "You have exceeded the maximum allowed reports";
+            string line2 = isRu
+                ? "Предоставьте ваш <color=#5599FF>Discord</color> для того, чтобы с вами связалась наша администрация"
+                : "Please provide your <color=#5599FF>Discord</color> username so the administration team can contact you";
+            string line3 = isRu
+                ? "В случае игнорирования данного сообщения вы получите <color=#FF4444>блокировку на сервере</color>!"
+                : "If you ignore this message, you will be <color=#FF4444>banned on the server</color>!";
+            string cmd = isRu
+                ? "Команда для предоставления Discord — <color=#5599FF>/discord ВашДискорд</color>"
+                : "Command to provide your Discord — <color=#5599FF>/discord YourDiscord</color>";
 
             var elements = new CuiElementContainer();
 
             var panel = elements.Add(new CuiPanel
             {
                 Image = { Color = "0 0 0 0.85", Material = "assets/content/ui/uibackgroundblur.mat" },
-                RectTransform = { AnchorMin = "0.25 0.6", AnchorMax = "0.75 0.85" },
+                RectTransform = { AnchorMin = "0.2 0.54", AnchorMax = "0.8 0.88" },
                 CursorEnabled = false
             }, "Overlay", CHECK_PANEL_UI);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = title, FontSize = 20, Align = TextAnchor.MiddleCenter, Color = "1 0.2 0.2 1" },
-                RectTransform = { AnchorMin = "0 0.7", AnchorMax = "1 1" }
+                Text = { Text = title, FontSize = 22, Align = TextAnchor.MiddleCenter, Color = "1 0.2 0.2 1" },
+                RectTransform = { AnchorMin = "0.02 0.76", AnchorMax = "0.98 0.98" }
             }, panel);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = line1, FontSize = 14, Align = TextAnchor.MiddleCenter, Color = "1 1 1 0.9" },
-                RectTransform = { AnchorMin = "0 0.45", AnchorMax = "1 0.7" }
+                Text = { Text = line1, FontSize = 15, Align = TextAnchor.MiddleCenter, Color = "1 1 1 0.95" },
+                RectTransform = { AnchorMin = "0.02 0.58", AnchorMax = "0.98 0.76" }
             }, panel);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = line2, FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 0.8" },
-                RectTransform = { AnchorMin = "0 0.2", AnchorMax = "1 0.45" }
+                Text = { Text = line2, FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "0.9 0.9 0.9 0.95" },
+                RectTransform = { AnchorMin = "0.02 0.38", AnchorMax = "0.98 0.58" }
             }, panel);
 
             elements.Add(new CuiLabel
             {
-                Text = { Text = discord, FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.6 1 0.6 0.9" },
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 0.2" }
+                Text = { Text = line3, FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "0.9 0.9 0.9 0.95" },
+                RectTransform = { AnchorMin = "0.02 0.19", AnchorMax = "0.98 0.38" }
+            }, panel);
+
+            elements.Add(new CuiLabel
+            {
+                Text = { Text = cmd, FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "0.75 0.78 0.85 0.95" },
+                RectTransform = { AnchorMin = "0.02 0.02", AnchorMax = "0.98 0.19" }
             }, panel);
 
             CuiHelper.AddUi(player, elements);
