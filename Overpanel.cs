@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.5.1")]
+    [Info("Overpanel", "Gooseoma", "1.5.2")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -167,7 +167,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.5.1";
+        internal const string PLUGIN_VERSION = "1.5.2";
 
         internal PluginConfig _config;
 
@@ -1918,23 +1918,79 @@ namespace Oxide.Plugins
         ///
         /// Клиент Rust воспроизводит голос только от сущности игрока, которая
         /// ему видна. Поэтому позади цели спавнится невидимый для остальных
-        /// фейковый игрок, и Opus-фреймы шлются пакетами VoiceData от его имени
-        /// с интервалом 20 мс — ровно так, как их шлёт настоящий клиент.
+        /// фейковый игрок, и Opus-пакеты шлются пакетами VoiceData от его имени
+        /// в темпе, равном длительности пакета из его же заголовка.
         /// </summary>
 
-        // Длительность одного Opus-пакета в файлах check_*.bin. Файлы записаны
-        // в том же профиле, что использует сам клиент Rust (SILK Wideband,
-        // стерео, мультифрейм по 60 мс). Раньше здесь стояло 20 мс под старые
-        // файлы в профиле Hybrid Fullband — их клиент не проигрывал вовсе.
-        private const float FRAME_INTERVAL   = 0.06f;
-        private const int   MAX_FRAME_SIZE   = 2048;
+        // Темп отправки больше не задаётся константой: длительность пакета
+        // читается из самого Opus-заголовка (TOC-байт). Фиксированное значение
+        // уже дважды расходилось с реальным содержимым файлов, и звук молча
+        // пропадал — теперь такой рассинхрон невозможен в принципе.
+
+        // Клиент Rust декодирует голос в буфер, рассчитанный на короткие пакеты
+        // собственного кодировщика. Пакет длиннее ~30 мс он отбрасывает молча:
+        // ни звука, ни ошибки. Рабочий эталон (IQReportSystem) шлёт ровно 30 мс
+        // — три Opus-субфрейма по 10 мс, склеенных репакетайзером.
+        private const float MAX_SAFE_PACKET_MS = 30f;
+
+        // Запасное значение, если TOC не разобрался (файл битый/чужой формат).
+        private const float FALLBACK_INTERVAL = 0.02f;
+        private const int   MAX_FRAME_SIZE    = 2048;
 
         /// Пауза перед первым фреймом: клиенту нужно успеть создать сущность
         /// носителя, иначе первые пакеты приходят «в никуда».
         private const float VOICE_WARMUP_SEC = 0.35f;
 
-        // Кеш распарсенных фреймов: путь → фреймы. Читаем файл один раз.
-        private readonly Dictionary<string, byte[][]> _audioCache = new Dictionary<string, byte[][]>();
+        // Кеш распарсенных клипов: путь → клип. Читаем файл один раз.
+        private readonly Dictionary<string, VoiceClip> _audioCache = new Dictionary<string, VoiceClip>();
+
+        /// <summary>
+        /// Готовая к отправке дорожка: Opus-пакеты и темп, с которым их надо
+        /// слать. Темп равен длительности пакета, вычисленной из его заголовка.
+        /// </summary>
+        private sealed class VoiceClip
+        {
+            public byte[][] Frames;
+            public float    Interval;   // секунды между пакетами
+            public float    PacketMs;   // длительность одного пакета
+        }
+
+        // Длительности базового фрейма Opus по конфигурации из TOC-байта
+        private static readonly float[] SilkFrameMs = { 10f, 20f, 40f, 60f };
+        private static readonly float[] CeltFrameMs = { 2.5f, 5f, 10f, 20f };
+
+        /// <summary>
+        /// Длительность Opus-пакета в миллисекундах, разобранная из TOC-байта.
+        /// Формат описан в RFC 6716 §3.1: старшие 5 бит — конфигурация
+        /// (режим + полоса + длина фрейма), младшие 2 — число фреймов в пакете.
+        /// Возвращает 0, если пакет разобрать не удалось.
+        /// </summary>
+        private static float GetPacketDurationMs(byte[] packet)
+        {
+            if (packet == null || packet.Length < 1) return 0f;
+
+            int config = packet[0] >> 3;
+            int code   = packet[0] & 3;
+
+            float baseMs;
+            if (config < 12)        baseMs = SilkFrameMs[config & 3];          // SILK NB/MB/WB
+            else if (config < 16)   baseMs = (config & 1) == 0 ? 10f : 20f;    // Hybrid SWB/FB
+            else                    baseMs = CeltFrameMs[config & 3];          // CELT
+
+            int frames;
+            switch (code)
+            {
+                case 0:  frames = 1; break;
+                case 1:
+                case 2:  frames = 2; break;
+                default:
+                    if (packet.Length < 2) return 0f;
+                    frames = packet[1] & 0x3F;   // code 3: счётчик фреймов
+                    break;
+            }
+
+            return frames <= 0 ? 0f : baseMs * frames;
+        }
 
         // Активные стримы: steamId цели → корутина
         private readonly Dictionary<string, Coroutine> _activeStreams = new Dictionary<string, Coroutine>();
@@ -1946,7 +2002,7 @@ namespace Oxide.Plugins
         /// Формат .bin: последовательность [int32 length][length байт Opus-фрейма].
         /// Порядок байт — little-endian (как пишет BinaryWriter).
         /// </summary>
-        private byte[][] ReadOpusFrames(string relativePath)
+        private VoiceClip ReadOpusFrames(string relativePath)
         {
             if (_audioCache.TryGetValue(relativePath, out var cached))
                 return cached;
@@ -1992,12 +2048,41 @@ namespace Oxide.Plugins
                 }
 
                 var result = frames.ToArray();
-                _audioCache[relativePath] = result;
 
-                Puts($"[Overpanel] Загружено {result.Length} Opus-фреймов из {relativePath} " +
-                     $"(~{result.Length * FRAME_INTERVAL:F1} сек)");
+                // Темп берём из самого потока, а не из константы: заголовок
+                // Opus точно знает, сколько звука лежит в пакете.
+                var packetMs = GetPacketDurationMs(result[0]);
+                if (packetMs <= 0f)
+                {
+                    PrintWarning($"[Overpanel] {relativePath}: не удалось определить длительность " +
+                                 $"пакета по заголовку Opus, беру {FALLBACK_INTERVAL * 1000:F0} мс.");
+                    packetMs = FALLBACK_INTERVAL * 1000f;
+                }
 
-                return result;
+                var clip = new VoiceClip
+                {
+                    Frames   = result,
+                    PacketMs = packetMs,
+                    Interval = packetMs / 1000f,
+                };
+
+                _audioCache[relativePath] = clip;
+
+                Puts($"[Overpanel] Загружено {result.Length} Opus-пакетов из {relativePath} " +
+                     $"(по {packetMs:F0} мс, ~{result.Length * clip.Interval:F1} сек)");
+
+                // Слишком длинный пакет клиент Rust отбрасывает без единой
+                // ошибки — звука просто нет. Предупреждаем явно, иначе такую
+                // поломку невозможно отличить от «плагин не сработал».
+                if (packetMs > MAX_SAFE_PACKET_MS)
+                {
+                    PrintError($"[Overpanel] {relativePath}: пакеты по {packetMs:F0} мс — " +
+                               $"клиент Rust проигрывает только до {MAX_SAFE_PACKET_MS:F0} мс " +
+                               $"и молча отбросит их. Перекодируйте файл в пакеты по 30 мс " +
+                               $"(3 субфрейма Opus по 10 мс).");
+                }
+
+                return clip;
             }
             catch (Exception ex)
             {
@@ -2017,10 +2102,10 @@ namespace Oxide.Plugins
         {
             if (target == null || !target.IsConnected) return;
 
-            var lang  = GetPlayerLanguage(target) == "en" ? "en" : "ru";
-            var frames = ReadOpusFrames($"audio/check_{lang}.bin");
+            var lang = GetPlayerLanguage(target) == "en" ? "en" : "ru";
+            var clip = ReadOpusFrames($"audio/check_{lang}.bin");
 
-            if (frames == null)
+            if (clip == null)
             {
                 // Голос не критичен — оверлей уже показан, продолжаем текстом
                 SendCheckTextFallback(target, lang);
@@ -2045,7 +2130,7 @@ namespace Oxide.Plugins
             _fakePlayers[target.UserIDString] = carrier;
 
             var coroutine = ServerMgr.Instance.StartCoroutine(
-                StreamVoiceFrames(target, carrier, frames, sessionId));
+                StreamVoiceFrames(target, carrier, clip, sessionId));
 
             _activeStreams[target.UserIDString] = coroutine;
         }
@@ -2200,9 +2285,12 @@ namespace Oxide.Plugins
         private IEnumerator StreamVoiceFrames(
             BasePlayer target,
             VoiceCarrier carrier,
-            byte[][] frames,
+            VoiceClip clip,
             string sessionId)
         {
+            var frames   = clip.Frames;
+            var interval = clip.Interval;
+
             // Раньше здесь было yield return new WaitForSeconds(0.02) на каждый фрейм.
             // Корутина не может проснуться чаще кадра сервера, поэтому на 30 FPS
             // 20-мс фреймы уходили раз в ~33 мс: дорожка растягивалась в полтора
@@ -2220,7 +2308,7 @@ namespace Oxide.Plugins
                 if (target == null || !target.IsConnected) break;
 
                 var elapsed = UnityEngine.Time.realtimeSinceStartup - startedAt;
-                var due = Mathf.Min(frames.Length, Mathf.CeilToInt(elapsed / FRAME_INTERVAL) + 1);
+                var due = Mathf.Min(frames.Length, Mathf.CeilToInt(elapsed / interval) + 1);
 
                 while (sentFrames < due)
                 {
