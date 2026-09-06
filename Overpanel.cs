@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.5.2")]
+    [Info("Overpanel", "Gooseoma", "1.5.3")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -167,7 +167,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.5.2";
+        internal const string PLUGIN_VERSION = "1.5.3";
 
         internal PluginConfig _config;
 
@@ -953,6 +953,10 @@ namespace Oxide.Plugins
             public string Name       { get; set; }
             public int    Level      { get; set; } = 0;
             public string Title      { get; set; } = "Тестер";
+            /// Игрок попросил не показывать в чате, что он администратор:
+            /// сообщения уходят обычным ванильным чатом. На права не влияет —
+            /// Level и Permissions продолжают действовать.
+            public bool   HideRole   { get; set; }
             public string RoleId     { get; set; }
             public HashSet<string> Permissions { get; set; } = new HashSet<string>();
             public int Mutes         { get; set; }
@@ -1039,6 +1043,7 @@ namespace Oxide.Plugins
                     Name        = entry["name"]?.ToString() ?? steamId,
                     Level       = entry["level"]?.ToObject<int>() ?? 0,
                     Title       = entry["title"]?.ToString() ?? "Тестер",
+                    HideRole    = entry["hide_role"]?.ToObject<bool>() ?? false,
                     RoleId      = entry["role_id"]?.ToString(),
                     Permissions = new HashSet<string>(
                         entry["permissions"]?.ToObject<List<string>>() ?? new List<string>()),
@@ -1585,8 +1590,12 @@ namespace Oxide.Plugins
             // сообщение через SeparatorChat независимо от того, что вернут другие
             // плагины (Oxide вызывает все подписанные хуки, а не только первый) —
             // если бы мы тоже транслировали здесь, сообщение админа ушло бы дважды.
+            // HideRole — админ выключил показ роли в настройках профиля: не
+            // трогаем сообщение вовсе, оно уходит ванильным чатом (обычный ник,
+            // без роли и без цвета). Права при этом остаются.
             if (channelName == "Global" && !HasIntegration("IQChat")
-                && _adminsCache.TryGetValue(player.UserIDString, out var chatAdmin))
+                && _adminsCache.TryGetValue(player.UserIDString, out var chatAdmin)
+                && !chatAdmin.HideRole)
             {
                 // Ник берём у самого игрока (его реальный текущий displayName),
                 // а не из AdminData.Name — тот может отставать от игрового ника,
