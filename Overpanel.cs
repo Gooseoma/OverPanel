@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.5.3")]
+    [Info("Overpanel", "Gooseoma", "1.5.4")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -167,7 +167,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.5.3";
+        internal const string PLUGIN_VERSION = "1.5.4";
 
         internal PluginConfig _config;
 
@@ -636,6 +636,7 @@ namespace Oxide.Plugins
                 var wsUrl = BuildWebSocketUrl();
                 _ws = new WebSocket(wsUrl);
                 _ws.WaitTime = TimeSpan.FromSeconds(10);
+                ApplyTlsSettings(wsUrl);
 
                 _ws.OnOpen    += OnWsOpen;
                 _ws.OnMessage += OnWsMessage;
@@ -648,6 +649,46 @@ namespace Oxide.Plugins
             {
                 PrintError($"[Overpanel] Не удалось создать WS-соединение: {ex.Message}");
                 ScheduleReconnect();
+            }
+        }
+
+        // Значения из SslProtocols числами: Tls12 = 3072, Tls13 = 12288.
+        // В Mono, на котором работает Oxide, элемента Tls13 в перечислении
+        // может не быть вовсе — обращение по имени там не компилируется.
+        private const int TLS_12 = 3072;
+        private const int TLS_13 = 12288;
+
+        /// <summary>
+        /// Явно включает TLS 1.2/1.3 для защищённого соединения.
+        ///
+        /// WebSocketSharp по умолчанию предлагает TLS 1.0. Современный сервер
+        /// (nginx на OpenSSL 3) такое рукопожатие обрывает — соединение
+        /// закрывается с кодом 1015 и плагин уходит в бесконечный реконнект.
+        /// Под Carbon проблема не проявляется: там своя, более новая
+        /// TLS-реализация, поэтому баг виден только на Oxide.
+        /// </summary>
+        private void ApplyTlsSettings(string wsUrl)
+        {
+            // У незащищённого ws:// обращение к SslConfiguration бросает исключение
+            if (!wsUrl.StartsWith("wss://", StringComparison.OrdinalIgnoreCase)) return;
+
+            try
+            {
+                _ws.SslConfiguration.EnabledSslProtocols =
+                    (System.Security.Authentication.SslProtocols)(TLS_12 | TLS_13);
+            }
+            catch (Exception)
+            {
+                // Рантайм не знает про TLS 1.3 — хватит и 1.2
+                try
+                {
+                    _ws.SslConfiguration.EnabledSslProtocols =
+                        (System.Security.Authentication.SslProtocols)TLS_12;
+                }
+                catch (Exception ex)
+                {
+                    PrintWarning($"[Overpanel] Не удалось задать версию TLS: {ex.Message}");
+                }
             }
         }
 
