@@ -169,7 +169,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.5.4";
+        internal const string PLUGIN_VERSION = "1.5.5";
 
         internal PluginConfig _config;
 
