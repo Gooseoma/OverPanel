@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.5.4")]
+    [Info("Overpanel", "Gooseoma", "1.5.5")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -64,6 +64,7 @@ namespace Oxide.Plugins
             DetectFramework();
             DetectIntegrations();
             InitRconCapture();
+            InitGroupTracking();
             InitAccessListScheduler();
             InitMapTimer();
             InitStatsTimer();
@@ -77,6 +78,7 @@ namespace Oxide.Plugins
         {
             ShutdownAudio();
             ShutdownRconCapture();
+            ShutdownGroupTracking();
             ShutdownWebSocket();
             CleanupAll();
         }
@@ -979,6 +981,10 @@ namespace Oxide.Plugins
                     ["admin_title"] = isAdmin ? GetAdminTitle(player.UserIDString, null) : null,
                 });
             }
+
+            // Пока связи не было, тимы могли распасться, а кланы — смениться.
+            // Отдельных событий об этом панель не получит, поэтому шлём снимок.
+            SendGroupSnapshot();
         }
 
         #endregion
@@ -3895,6 +3901,264 @@ namespace Oxide.Plugins
             // report.list_response ниже подхватит _pendingOpenReportId и откроет CUI обращения
             _pendingOpenReportId[player.userID] = reportId;
             RequestReportList(player);
+        }
+
+        #endregion
+
+        #region Teams & Clans
+
+        /// <summary>
+        /// Тимы и кланы. В панель всегда уходит ПОЛНЫЙ состав группы, а не
+        /// «вошёл/вышел»: одно пропущенное событие иначе рассинхронизирует
+        /// состав навсегда, а полный состав чинит себя следующим же
+        /// обновлением.
+        /// </summary>
+
+        private const float CLAN_SYNC_INTERVAL = 60f;
+        private Timer _clanSyncTimer;
+
+        private void InitGroupTracking()
+        {
+            // У кланов, в отличие от тим, нет хуков с известной сигнатурой,
+            // поэтому состав снимаем периодически.
+            _clanSyncTimer = timer.Every(CLAN_SYNC_INTERVAL, SendClanUpdates);
+        }
+
+        private void ShutdownGroupTracking()
+        {
+            _clanSyncTimer?.Destroy();
+        }
+
+        private string ResolvePlayerName(ulong userId)
+        {
+            var online = BasePlayer.FindByID(userId);
+            if (online != null) return online.displayName;
+
+            var sleeping = BasePlayer.FindSleeping(userId);
+            if (sleeping != null) return sleeping.displayName;
+
+            return userId.ToString();
+        }
+
+        // ── Тимы ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Хуки тим срабатывают ДО того, как состав фактически изменится,
+        /// поэтому читаем его не сразу, а следующим тиком.
+        /// </summary>
+        private void ScheduleTeamSync(ulong teamId)
+        {
+            if (teamId == 0UL) return;
+            timer.Once(0.25f, () => SendTeamUpdate(teamId));
+        }
+
+        private void SendTeamUpdate(ulong teamId)
+        {
+            if (teamId == 0UL) return;
+
+            var members = new List<object>();
+            ulong leader = 0UL;
+
+            var team = RelationshipManager.ServerInstance?.FindTeam(teamId);
+            if (team != null)
+            {
+                leader = team.teamLeader;
+                foreach (var id in team.members)
+                {
+                    members.Add(new Dictionary<string, object>
+                    {
+                        ["steamid"] = id.ToString(),
+                        ["name"]    = ResolvePlayerName(id),
+                    });
+                }
+            }
+
+            // Тима распалась — team == null, состав пустой. Панель по пустому
+            // составу закрывает всем участникам период.
+            SendEvent("team.update", new Dictionary<string, object>
+            {
+                ["team_id"]        = teamId.ToString(),
+                ["leader_steamid"] = leader == 0UL ? null : leader.ToString(),
+                ["members"]        = members,
+            });
+        }
+
+        void OnTeamCreated(BasePlayer player, RelationshipManager.PlayerTeam team)
+        {
+            if (team != null) ScheduleTeamSync(team.teamID);
+        }
+
+        void OnTeamAcceptInvite(RelationshipManager.PlayerTeam team, BasePlayer player)
+        {
+            if (team != null) ScheduleTeamSync(team.teamID);
+        }
+
+        void OnTeamLeave(RelationshipManager.PlayerTeam team, BasePlayer player)
+        {
+            if (team != null) ScheduleTeamSync(team.teamID);
+        }
+
+        void OnTeamKick(RelationshipManager.PlayerTeam team, BasePlayer player, ulong target)
+        {
+            if (team != null) ScheduleTeamSync(team.teamID);
+        }
+
+        void OnTeamPromote(RelationshipManager.PlayerTeam team, BasePlayer newLeader)
+        {
+            if (team != null) ScheduleTeamSync(team.teamID);
+        }
+
+        void OnTeamDisbanded(RelationshipManager.PlayerTeam team)
+        {
+            if (team != null) ScheduleTeamSync(team.teamID);
+        }
+
+        // ── Кланы (нативная система Facepunch) ───────────────────────
+
+        /// <summary>
+        /// Название клана из нативной системы Facepunch.
+        ///
+        /// Только через рефлексию: пространство Rust.Clans, где объявлен IClan,
+        /// компилятору плагинов недоступно — прямая ссылка на него не собирается.
+        /// Путь установлен по факту, дампом рантайма:
+        ///   ClanManager.ServerInstance -> Backend (LocalClanBackend)
+        ///   -> bool TryGet(long clanId, out IClan clan)
+        ///   -> IClan.Name
+        /// Результат кэшируем: имя меняется редко, а рефлексия на каждый
+        /// тик таймера ни к чему.
+        /// </summary>
+        private readonly Dictionary<long, string> _clanNameCache = new Dictionary<long, string>();
+
+        private string TryResolveClanName(long clanId)
+        {
+            string cached;
+            if (_clanNameCache.TryGetValue(clanId, out cached)) return cached;
+
+            string name = null;
+            try
+            {
+                var managerType = Type.GetType("ClanManager, Assembly-CSharp");
+                var serverInstance = managerType?.GetProperty("ServerInstance",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                var manager = serverInstance?.GetValue(null);
+
+                var backendProp = manager?.GetType().GetProperty("Backend",
+                    System.Reflection.BindingFlags.Public
+                  | System.Reflection.BindingFlags.NonPublic
+                  | System.Reflection.BindingFlags.Instance);
+                var backend = backendProp?.GetValue(manager);
+
+                if (backend != null)
+                {
+                    // Тип out-параметра назвать не можем, поэтому ищем метод по
+                    // имени и форме сигнатуры, а не через GetMethod(types)
+                    foreach (var m in backend.GetType().GetMethods())
+                    {
+                        if (m.Name != "TryGet") continue;
+                        var ps = m.GetParameters();
+                        if (ps.Length != 2 || ps[0].ParameterType != typeof(long)) continue;
+
+                        var args = new object[] { clanId, null };
+                        var ok = m.Invoke(backend, args);
+                        if (ok is bool && (bool)ok && args[1] != null)
+                        {
+                            var nameProp = args[1].GetType().GetProperty("Name");
+                            name = nameProp?.GetValue(args[1]) as string;
+                        }
+                        break;
+                    }
+                }
+            }
+            catch
+            {
+                // Сборка Rust без нативных кланов — клан уйдёт без названия
+            }
+
+            _clanNameCache[clanId] = name;
+            return name;
+        }
+
+        private void SendClanUpdates()
+        {
+            var byClan = new Dictionary<long, List<BasePlayer>>();
+
+            // allPlayerList — вместе со спящими: клан не перестаёт существовать
+            // от того, что половина состава оффлайн.
+            foreach (var player in BasePlayer.allPlayerList)
+            {
+                if (player == null || player.clanId == 0L) continue;
+
+                List<BasePlayer> list;
+                if (!byClan.TryGetValue(player.clanId, out list))
+                {
+                    list = new List<BasePlayer>();
+                    byClan[player.clanId] = list;
+                }
+                list.Add(player);
+            }
+
+            foreach (var pair in byClan)
+            {
+                var members = new List<object>();
+                foreach (var member in pair.Value)
+                {
+                    members.Add(new Dictionary<string, object>
+                    {
+                        ["steamid"] = member.UserIDString,
+                        ["name"]    = member.displayName,
+                    });
+                }
+
+                SendEvent("clan.update", new Dictionary<string, object>
+                {
+                    ["clan_id"] = pair.Key.ToString(),
+                    ["name"]    = TryResolveClanName(pair.Key),
+                    ["members"] = members,
+                });
+            }
+        }
+
+        // ── Полный снимок ────────────────────────────────────────────
+
+        private void SendGroupSnapshot()
+        {
+            var teams = new List<object>();
+
+            var manager = RelationshipManager.ServerInstance;
+            if (manager != null)
+            {
+                foreach (var pair in manager.teams)
+                {
+                    var team = pair.Value;
+                    if (team == null) continue;
+
+                    var members = new List<object>();
+                    foreach (var id in team.members)
+                    {
+                        members.Add(new Dictionary<string, object>
+                        {
+                            ["steamid"] = id.ToString(),
+                            ["name"]    = ResolvePlayerName(id),
+                        });
+                    }
+
+                    teams.Add(new Dictionary<string, object>
+                    {
+                        ["team_id"]        = team.teamID.ToString(),
+                        ["leader_steamid"] = team.teamLeader == 0UL ? null : team.teamLeader.ToString(),
+                        ["members"]        = members,
+                    });
+                }
+            }
+
+            SendEvent("group.snapshot", new Dictionary<string, object>
+            {
+                ["teams"] = teams,
+            });
+
+            // Кланы отдельным потоком событий: у них свой формат и свой
+            // список участников, в снимок тим они не помещаются.
+            SendClanUpdates();
         }
 
         #endregion
