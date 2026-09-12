@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.5.5")]
+    [Info("Overpanel", "Gooseoma", "1.5.8")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -77,6 +77,7 @@ namespace Oxide.Plugins
         void Unload()
         {
             ShutdownAudio();
+            ShutdownDemoTracking();
             ShutdownRconCapture();
             ShutdownGroupTracking();
             ShutdownWebSocket();
@@ -169,7 +170,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.5.5";
+        internal const string PLUGIN_VERSION = "1.5.8";
 
         internal PluginConfig _config;
 
@@ -258,6 +259,13 @@ namespace Oxide.Plugins
                 // Панельная настройка сервера, а не файловый конфиг — в _config не пишем
                 case "improved_reports":
                     bool.TryParse(value?.ToString(), out _improvedReports);
+                    return;
+
+                // Запись демок тяжёлая, поэтому включается на каждом сервере
+                // отдельно — применяем на лету, без перезагрузки плагина
+                case "demo_recording":
+                    bool demoOn;
+                    if (bool.TryParse(value?.ToString(), out demoOn)) ApplyDemoRecordingSetting(demoOn);
                     return;
             }
             SaveConfig();
@@ -931,6 +939,8 @@ namespace Oxide.Plugins
 
                 case "chat.send":         HandleActionChatSend(msg);   break;
 
+                case "report.f7.created": HandleActionReportCreated(msg); break;
+
                 case "rcon.exec":         HandleActionRconExec(msg, requestId); break;
 
                 case "restart.start":     HandleActionRestartStart(msg);  break;
@@ -1227,6 +1237,36 @@ namespace Oxide.Plugins
             return null;
         }
 
+        /// <summary>
+        /// Отключает тех, кто уже в игре, но попал в чёрный список.
+        ///
+        /// CanUserLogin проверяет список только на входе, поэтому игрок,
+        /// внесённый в чёрный список во время сессии, продолжал играть до
+        /// следующего захода — ограничение включалось с задержкой в целую
+        /// сессию.
+        ///
+        /// Кик тихий: без причины на экране и без объявления в чате. Закрытие
+        /// доступа — не наказание, публично объявлять о нём нечего, а сам
+        /// игрок увидит отказ при попытке зайти снова.
+        /// </summary>
+        private void EnforceAccessList()
+        {
+            if (!_config.Modules.AccessList) return;
+
+            var state = GetAccessListState();
+            if (state.Mode != "blacklist" || state.SteamIds.Count == 0) return;
+
+            // Копия списка: Kick меняет activePlayerList прямо во время обхода
+            foreach (var player in BasePlayer.activePlayerList.ToList())
+            {
+                if (player == null || !player.IsConnected) continue;
+                if (!state.SteamIds.Contains(player.UserIDString)) continue;
+
+                Puts($"[Overpanel][AccessList] {player.displayName} в чёрном списке — отключён");
+                player.Kick(string.Empty);
+            }
+        }
+
         internal void UpdateAccessList(string serverId, string mode, List<string> steamIds)
         {
             var state = new AccessListState
@@ -1238,6 +1278,8 @@ namespace Oxide.Plugins
 
             Interface.Oxide.DataFileSystem.WriteObject("Overpanel/accesslist", state);
             Puts($"[Overpanel][AccessList] Обновлён: режим={mode}, записей={steamIds.Count}");
+
+            EnforceAccessList();
         }
 
         internal void AddToAccessList(string serverId, string steamId, string mode)
@@ -1246,6 +1288,8 @@ namespace Oxide.Plugins
             state.SteamIds.Add(steamId);
             state.Mode = mode;
             Interface.Oxide.DataFileSystem.WriteObject("Overpanel/accesslist", state);
+
+            EnforceAccessList();
         }
 
         internal void RemoveFromAccessList(string serverId, string steamId)
@@ -4163,6 +4207,285 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Демки и репорты F7
+
+        /// <summary>
+        /// Непрерывная запись демок с ротацией и жалобы через F7.
+        ///
+        /// Идея: демка нужна на того, НА КОГО пожаловались, а значит писать
+        /// приходится всех заранее — в момент жалобы записывать уже поздно.
+        /// Поэтому запись идёт постоянно окнами по 10 минут: окно закончилось
+        /// без жалобы — файл удаляется, запись начинается заново.
+        ///
+        /// Замер на живом сервере: ~4.4 МБ в минуту на игрока, то есть при
+        /// сотне онлайна это сотни гигабайт записи в сутки. Поэтому вся
+        /// подсистема выключена по умолчанию и включается на каждом сервере
+        /// отдельно настройкой demo_recording из панели.
+        /// </summary>
+
+        private bool _demoRecording = false;
+
+        /// Длина окна записи. Совпадает со сроком, который назвал пользователь.
+        private const float DEMO_ROTATE_INTERVAL = 600f;
+
+        private Timer _demoRotateTimer;
+
+        /// Кого сейчас пишем. Держим id, а не BasePlayer: игрок может выйти.
+        private readonly HashSet<ulong> _demoActive = new HashSet<ulong>();
+
+        /// <summary>
+        /// Папка с демками игрока.
+        ///
+        /// ConVar.Server.GetServerFolder("demos") возвращает server/rust/demos,
+        /// но движок пишет НЕ туда — проверено замером: файлы ложатся в
+        /// demos/&lt;steamid&gt;/&lt;дата&gt;.dem относительно рабочей папки сервера.
+        /// </summary>
+        private string DemoDirOf(string steamId)
+        {
+            return Path.Combine("demos", steamId);
+        }
+
+        /// <summary>Самый свежий .dem игрока, либо null.</summary>
+        private string NewestDemoOf(string steamId)
+        {
+            try
+            {
+                var dir = DemoDirOf(steamId);
+                if (!Directory.Exists(dir)) return null;
+
+                string newest = null;
+                DateTime newestAt = DateTime.MinValue;
+                foreach (var f in Directory.GetFiles(dir, "*.dem"))
+                {
+                    var at = File.GetLastWriteTimeUtc(f);
+                    if (at <= newestAt) continue;
+                    newestAt = at;
+                    newest = f;
+                }
+                return newest;
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"[Overpanel] Не удалось прочитать папку демок {steamId}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private void DeleteDemosOf(string steamId, string except = null)
+        {
+            try
+            {
+                var dir = DemoDirOf(steamId);
+                if (!Directory.Exists(dir)) return;
+
+                foreach (var f in Directory.GetFiles(dir, "*.dem"))
+                {
+                    if (except != null && f == except) continue;
+                    try { File.Delete(f); } catch { /* занят движком — заберём следующей ротацией */ }
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"[Overpanel] Не удалось почистить демки {steamId}: {ex.Message}");
+            }
+        }
+
+        private void StartDemoFor(BasePlayer player)
+        {
+            if (!_demoRecording || player == null || !player.IsConnected) return;
+            if (_demoActive.Contains(player.userID)) return;
+
+            try
+            {
+                player.StartServerDemoRecording();
+                _demoActive.Add(player.userID);
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"[Overpanel] Не удалось начать запись для {player.displayName}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Останавливает запись. keepFile=false — файл сразу удаляется: окно
+        /// прошло без жалоб, хранить нечего.
+        /// </summary>
+        private void StopDemoFor(BasePlayer player, bool keepFile)
+        {
+            if (player == null) return;
+            _demoActive.Remove(player.userID);
+
+            try { player.StopServerDemoRecording(); }
+            catch (Exception ex) { PrintWarning($"[Overpanel] Стоп записи: {ex.Message}"); }
+
+            if (!keepFile) DeleteDemosOf(player.UserIDString);
+        }
+
+        /// <summary>Окно закончилось: всех пишущихся перезапускаем с чистого листа.</summary>
+        private void RotateDemos()
+        {
+            if (!_demoRecording) return;
+
+            foreach (var player in BasePlayer.activePlayerList.ToList())
+            {
+                if (player == null || !player.IsConnected) continue;
+                StopDemoFor(player, keepFile: false);
+                StartDemoFor(player);
+            }
+        }
+
+        private void StartDemoTracking()
+        {
+            _demoRotateTimer?.Destroy();
+            if (!_demoRecording) return;
+
+            foreach (var player in BasePlayer.activePlayerList.ToList())
+                StartDemoFor(player);
+
+            _demoRotateTimer = timer.Every(DEMO_ROTATE_INTERVAL, RotateDemos);
+            Puts($"[Overpanel] Запись демок включена, окно {DEMO_ROTATE_INTERVAL / 60f:0} мин.");
+        }
+
+        private void ShutdownDemoTracking()
+        {
+            _demoRotateTimer?.Destroy();
+            _demoRotateTimer = null;
+
+            foreach (var player in BasePlayer.activePlayerList.ToList())
+            {
+                if (player == null) continue;
+                if (!_demoActive.Contains(player.userID)) continue;
+                StopDemoFor(player, keepFile: false);
+            }
+
+            _demoActive.Clear();
+        }
+
+        /// <summary>Настройка пришла из панели — включаем или выключаем на лету.</summary>
+        private void ApplyDemoRecordingSetting(bool enabled)
+        {
+            if (_demoRecording == enabled) return;
+            _demoRecording = enabled;
+
+            if (enabled) StartDemoTracking();
+            else
+            {
+                ShutdownDemoTracking();
+                Puts("[Overpanel] Запись демок выключена.");
+            }
+        }
+
+        // ── Жалобы через F7 ──────────────────────────────────────────
+
+        /// <summary>
+        /// Встроенное окно жалоб Rust. Сигнатура взята с рабочего плагина
+        /// на этом же сервере, а не из документации.
+        /// </summary>
+        private void OnPlayerReported(BasePlayer reporter, string targetName, string targetId,
+                                      string subject, string message, string type)
+        {
+            if (reporter == null || string.IsNullOrEmpty(targetId)) return;
+
+            SendEvent("report.f7", new Dictionary<string, object>
+            {
+                ["reporter_steamid"] = reporter.UserIDString,
+                ["reporter_name"]    = reporter.displayName,
+                ["target_steamid"]   = targetId,
+                ["target_name"]      = targetName,
+                ["category"]         = string.IsNullOrEmpty(type) ? "other" : type,
+                ["subject"]          = subject,
+                ["message"]          = message,
+            });
+        }
+
+        /// <summary>
+        /// Панель завела репорт и вернула его id — пора приложить демку
+        /// нарушителя. Останавливаем его запись, отправляем файл и сразу
+        /// начинаем новое окно, чтобы запись не прерывалась.
+        /// </summary>
+        private void HandleActionReportCreated(JObject msg)
+        {
+            var reportId = msg["report_id"]?.ToString();
+            var targetId = msg["target_steamid"]?.ToString();
+            if (string.IsNullOrEmpty(reportId) || string.IsNullOrEmpty(targetId)) return;
+            if (!_demoRecording) return;
+
+            var target = BasePlayer.Find(targetId);
+            if (target == null) return;
+
+            // Файл дописывается движком асинхронно, поэтому берём его не сразу
+            StopDemoFor(target, keepFile: true);
+
+            timer.Once(3f, () =>
+            {
+                var file = NewestDemoOf(targetId);
+                if (string.IsNullOrEmpty(file))
+                {
+                    PrintWarning($"[Overpanel] Демка для репорта {reportId} не найдена");
+                }
+                else
+                {
+                    UploadDemo(reportId, targetId, file);
+                }
+
+                var again = BasePlayer.Find(targetId);
+                if (again != null) StartDemoFor(again);
+            });
+        }
+
+        /// <summary>
+        /// Отправка файла на панель сырым потоком.
+        ///
+        /// HttpClient компилятору плагинов недоступен, а собирать multipart
+        /// вручную значит класть бинарник в строку — приём ненадёжный. Поэтому
+        /// HttpWebRequest и application/octet-stream: байты уходят как есть.
+        /// Запрос идёт в фоновом потоке — файл весит десятки мегабайт, и в
+        /// основном потоке это повесило бы сервер.
+        /// </summary>
+        private void UploadDemo(string reportId, string steamId, string filePath)
+        {
+            var url = $"{_backendUrl.TrimEnd('/')}/player-reports/{reportId}/demo-upload";
+            var token = _serverToken;
+
+            new System.Threading.Thread(() =>
+            {
+                try
+                {
+                    var bytes = File.ReadAllBytes(filePath);
+
+                    var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+                    req.Method = "POST";
+                    req.ContentType = "application/octet-stream";
+                    req.Headers.Add("x-server-token", token);
+                    req.ContentLength = bytes.Length;
+                    req.Timeout = 300000;
+                    req.ReadWriteTimeout = 300000;
+
+                    using (var stream = req.GetRequestStream())
+                        stream.Write(bytes, 0, bytes.Length);
+
+                    using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+                    {
+                        var ok = (int)resp.StatusCode >= 200 && (int)resp.StatusCode < 300;
+                        // В основной поток возвращаемся через NextTick: Puts и
+                        // файловые операции плагина трогаем только оттуда
+                        NextTick(() =>
+                        {
+                            if (ok) Puts($"[Overpanel] Демка отправлена к репорту {reportId} ({bytes.Length / 1048576} МБ)");
+                            else PrintWarning($"[Overpanel] Панель отклонила демку: {(int)resp.StatusCode}");
+                            DeleteDemosOf(steamId);
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    NextTick(() => PrintWarning($"[Overpanel] Не удалось отправить демку: {ex.Message}"));
+                }
+            }) { IsBackground = true }.Start();
+        }
+
+        #endregion
+
         #region RCON
 
         /// <summary>
@@ -4362,6 +4685,10 @@ namespace Oxide.Plugins
 
         void OnPlayerConnected(BasePlayer player)
         {
+            // Зашедшего начинаем писать сразу: демка нужна на того, на кого
+            // пожалуются, а в момент жалобы записывать уже поздно
+            StartDemoFor(player);
+
             var ip = GetPlayerIp(player);
             var isPirate = IsPlayerPirate(player);
             bool isAdmin = _adminsCache.ContainsKey(player.UserIDString);
@@ -4584,6 +4911,25 @@ namespace Oxide.Plugins
 
         // ── WS-обработчики (панель → чат/телепорт) ───────────────────
 
+        /// <summary>
+        /// Всплывающая подсказка Rust (тост) поверх игры. type: 0 — синяя, 1 — красная.
+        ///
+        /// gametip.showtoast — команда клиента, а не сервера, поэтому уходит
+        /// игроку через SendConsoleCommand. Подсказка гаснет сама.
+        /// </summary>
+        private void ShowToast(BasePlayer player, string text, int type = 0)
+        {
+            if (player == null || !player.IsConnected) return;
+            try
+            {
+                player.SendConsoleCommand("gametip.showtoast", type, text);
+            }
+            catch
+            {
+                // Подсказка не критична: само сообщение уже лежит в чате
+            }
+        }
+
         private void HandleActionChatSend(JObject msg)
         {
             var targetId = msg["target_steamid"]?.ToString();
@@ -4620,10 +4966,18 @@ namespace Oxide.Plugins
                 return;
             }
 
+            // Личное сообщение внешне не отличалось от обычного чата, и игроки
+            // его просто не замечали. Отсюда явная пометка строкой выше и
+            // всплывающая подсказка: в чат ещё надо догадаться посмотреть.
             var text = senderLabel == "—"
                 ? $"[Overpanel] {message}"
                 : $"<color=#5599FF>[{senderLabel}]</color> {message}";
+
+            // Пометку шлём отдельной строкой, а не через перенос внутри одной:
+            // так не нужен escape, который легко потерять при правке файла.
+            SendReply(player, "<size=11><color=#8a8a8a>ЛС от администратора</color></size>");
             SendReply(player, text);
+            ShowToast(player, "Получено сообщение от администратора, посмотрите в чат!");
         }
 
         /// <summary>Обновляет локальный кэш /report CUI и перерисовывает открытый экран, если он открыт.</summary>
