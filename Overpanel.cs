@@ -31,7 +31,7 @@ namespace Oxide.Plugins
     ///   Punishments, Checks, Audio, CUI Overlays, Reports & Player Commands,
     ///   RCON, Player Hooks & Chat, Integrations.
     /// </summary>
-    [Info("Overpanel", "Gooseoma", "1.5.5")]
+    [Info("Overpanel", "Gooseoma", "1.5.6")]
     [Description("Administrative panel integration for Rust servers")]
     public class Overpanel : RustPlugin
     {
@@ -169,7 +169,7 @@ namespace Oxide.Plugins
 
         #region Configuration
 
-        internal const string PLUGIN_VERSION = "1.5.5";
+        internal const string PLUGIN_VERSION = "1.5.6";
 
         internal PluginConfig _config;
 
@@ -4584,6 +4584,25 @@ namespace Oxide.Plugins
 
         // ── WS-обработчики (панель → чат/телепорт) ───────────────────
 
+        /// <summary>
+        /// Всплывающая подсказка Rust (тост) поверх игры. type: 0 — синяя, 1 — красная.
+        ///
+        /// gametip.showtoast — команда клиента, а не сервера, поэтому уходит
+        /// игроку через SendConsoleCommand. Подсказка гаснет сама.
+        /// </summary>
+        private void ShowToast(BasePlayer player, string text, int type = 0)
+        {
+            if (player == null || !player.IsConnected) return;
+            try
+            {
+                player.SendConsoleCommand("gametip.showtoast", type, text);
+            }
+            catch
+            {
+                // Подсказка не критична: само сообщение уже лежит в чате
+            }
+        }
+
         private void HandleActionChatSend(JObject msg)
         {
             var targetId = msg["target_steamid"]?.ToString();
@@ -4620,10 +4639,18 @@ namespace Oxide.Plugins
                 return;
             }
 
+            // Личное сообщение внешне не отличалось от обычного чата, и игроки
+            // его просто не замечали. Отсюда явная пометка строкой выше и
+            // всплывающая подсказка: в чат ещё надо догадаться посмотреть.
             var text = senderLabel == "—"
                 ? $"[Overpanel] {message}"
                 : $"<color=#5599FF>[{senderLabel}]</color> {message}";
+
+            // Пометку шлём отдельной строкой, а не через перенос внутри одной:
+            // так не нужен escape, который легко потерять при правке файла.
+            SendReply(player, "<size=11><color=#8a8a8a>ЛС от администратора</color></size>");
             SendReply(player, text);
+            ShowToast(player, "Получено сообщение от администратора, посмотрите в чат!");
         }
 
         /// <summary>Обновляет локальный кэш /report CUI и перерисовывает открытый экран, если он открыт.</summary>
