@@ -71,7 +71,8 @@ namespace Oxide.Plugins
             InitYearlyRecap();
             RegisterCommands();
 
-            Puts($"[Overpanel] v{PLUGIN_VERSION} загружен на {(_isCarbon ? "Carbon" : "Oxide/uMod")}");
+            // Исправление на английский текст, некоторые консоли (Определенных хостеров таких как survgame) отображают их как эроглифы
+            Puts($"[Overpanel] v{PLUGIN_VERSION} loaded on {(_isCarbon ? "Carbon" : "Oxide/uMod")}");
         }
 
         void Unload()
