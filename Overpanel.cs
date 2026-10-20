@@ -45,6 +45,34 @@ namespace Oxide.Plugins
         {
             Instance = this;
         }
+        // добавление зависимости от античита плагина - без него плагин не будет загружаться
+        // Имя поля должно совпадать с именем плагина античита, иначе ссылка будет null
+[PluginReference] Plugin OverPanelAC;
+bool? _acReady; // null = ещё не проверяли
+
+void OnServerInitialized() => NextTick(CheckAC);
+
+void OnPluginLoaded(Plugin p)
+{
+    if (p.Name == "OverPanelAC") NextTick(CheckAC);
+}
+
+void OnPluginUnloaded(Plugin p)
+{
+    if (p.Name == "OverPanelAC") NextTick(CheckAC);
+}
+
+void CheckAC()
+{
+    bool ok = OverPanelAC != null && OverPanelAC.IsLoaded;
+    if (_acReady == ok) return;
+    _acReady = ok;
+
+    if (ok)
+        Puts("Античит найден, панель включена");
+    else
+        PrintError("Античит не найден, панель отключена. Установите OverPanelAC для работы панели.");
+}
 
         void OnServerInitialized()
         {
