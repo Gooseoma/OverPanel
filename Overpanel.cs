@@ -45,37 +45,26 @@ namespace Oxide.Plugins
         {
             Instance = this;
         }
-        // добавление зависимости от античита плагина - без него плагин не будет загружаться
-        // Имя поля должно совпадать с именем плагина античита, иначе ссылка будет null
-[PluginReference] Plugin OverPanelAC;
-bool? _acReady; // null = ещё не проверяли
+        // Ссылка на будущую интеграцию с античитом. Проверка вызывается
+        // из уже существующих хуков жизненного цикла ниже.
+        [PluginReference] Plugin OverPanelAC;
+        private bool? _acReady;
 
-void OnServerInitialized() => NextTick(CheckAC);
+        private void CheckAC()
+        {
+            bool available = OverPanelAC != null && OverPanelAC.IsLoaded;
+            if (_acReady == available) return;
+            _acReady = available;
 
-void OnPluginLoaded(Plugin p)
-{
-    if (p.Name == "OverPanelAC") NextTick(CheckAC);
-}
-
-void OnPluginUnloaded(Plugin p)
-{
-    if (p.Name == "OverPanelAC") NextTick(CheckAC);
-}
-
-void CheckAC()
-{
-    bool ok = OverPanelAC != null && OverPanelAC.IsLoaded;
-    if (_acReady == ok) return;
-    _acReady = ok;
-
-    if (ok)
-        Puts("Античит найден, панель включена");
-    else
-        PrintError("Античит не найден, панель отключена. Установите OverPanelAC для работы панели.");
-}
+            if (available)
+                Puts("[Overpanel] Античит OverPanelAC найден.");
+            else
+                PrintWarning("[Overpanel] Античит OverPanelAC не найден; интеграция с ним недоступна.");
+        }
 
         void OnServerInitialized()
         {
+            CheckAC();
             _isCarbon = IsCarbon();
 
             // Папки в data/Overpanel/ (в т.ч. audio/) должны существовать ДО проверки
@@ -4721,6 +4710,8 @@ void CheckAC()
 
         void OnPluginLoaded(Plugin plugin)
         {
+            if (plugin.Name == "OverPanelAC") NextTick(CheckAC);
+
             var changed = true;
 
             switch (plugin.Name)
@@ -4743,6 +4734,8 @@ void CheckAC()
 
         void OnPluginUnloaded(Plugin plugin)
         {
+            if (plugin.Name == "OverPanelAC") NextTick(CheckAC);
+
             var changed = true;
 
             switch (plugin.Name)
